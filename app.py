@@ -4,103 +4,89 @@ import ccxt
 import pandas_ta as ta
 import time
 
-# 1. Sayfa Ayarları
-st.set_page_config(layout="wide", page_title="Quant Pro | Trend & Signal Tracker")
+# Sayfa Ayarları
+st.set_page_config(layout="wide", page_title="Quant Pro | Ultimate Signal Alpha")
 
-# 2. Borsa Bağlantısı (Stabilite için Gate.io)
-exchange = ccxt.gateio({'enableRateLimit': True, 'timeout': 30000})
+# Borsa Bağlantısı (Bulut için en yüksek stabilite)
+exchange = ccxt.bybit({'enableRateLimit': True, 'timeout': 60000})
 
-st.markdown("# 🏛️ QUANT PRO - TREND VE SİNYAL TERMİNALİ")
+st.markdown("# 🏛️ QUANT PRO - ULTIMATE TREND TRACKER")
 st.write("---")
 
-# İzleme Listesi
-symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'SUI/USDT', 'AVAX/USDT', 'LINK/USDT', 'PEPE/USDT']
+symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'AVAX/USDT', 'SUI/USDT', 'PEPE/USDT']
 
-def trend_ve_sinyal_analizi():
+def get_pro_signals():
     rows = []
     progress = st.progress(0)
     
     for idx, symbol in enumerate(symbols):
         try:
-            # Hem H4 (Ana Trend) hem H1 (Giriş Sinyali) verisi çekilebilir ancak stabilite için H1 üzerinden gidelim
+            # Daha derin analiz için 200 mumluk veri (H1)
             bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # --- TREND İNDİKATÖRLERİ ---
-            # 1. EMA 200 (Ana Yön)
-            df['EMA200'] = ta.ema(df['close'], length=200)
-            # 2. ADX (Trendin Gücü: 25 üstü güçlü trenddir)
-            adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-            df = pd.concat([df, adx_df], axis=1)
-            # 3. SuperTrend (Yön Takibi)
-            st_df = ta.supertrend(df['high'], df['low'], df['close'], length=7, multiplier=3)
-            df = pd.concat([df, st_df], axis=1)
-            # 4. RSI (Giriş Zamanlaması)
-            df['RSI'] = ta.rsi(df['close'], length=14)
+            # 1. Trend: EMA 200 & SuperTrend
+            df['EMA200'] = ta.ema(df['c'], length=200)
+            st_data = ta.supertrend(df['h'], df['l'], df['c'], length=10, multiplier=3)
+            df = pd.concat([df, st_data], axis=1)
+            
+            # 2. Momentum: RSI & MACD
+            df['RSI'] = ta.rsi(df['c'], length=14)
+            macd = ta.macd(df['c'])
+            df = pd.concat([df, macd], axis=1)
             
             last = df.iloc[-1]
-            last_close = last['c']
-            last_rsi = last['RSI']
-            ema200 = last['EMA200']
-            adx = last['ADX_14']
-            st_direction = last['SUPERTd_7_3.0'] # 1 ise Boğa, -1 ise Ayı
+            c, rsi, ema = last['c'], last['RSI'], last['EMA200']
+            st_dir = last['SUPERTd_10_3.0'] # 1=Boğa, -1=Ayı
             
-            # --- TREND VE SİNYAL MANTIĞI ---
-            trend_durumu = ""
-            if last_close > ema200 and st_direction == 1:
-                trend_durumu = "📈 GÜÇLÜ BOĞA"
-            elif last_close < ema200 and st_direction == -1:
-                trend_durumu = "📉 GÜÇLÜ AYI"
-            elif last_close > ema200:
-                trend_durumu = "↗️ YUKARI"
-            else:
-                trend_durumu = "↘️ AŞAĞI"
+            # Gelişmiş Sinyal Skoru
+            score = 0
+            if c > ema: score += 25  # Ana Trend Pozitif
+            if st_dir == 1: score += 25 # SuperTrend Pozitif
+            if rsi < 40: score += 25 # Aşırı Satım (Toplama Alanı)
+            if last['MACD_12_26_9'] > last['MACDs_12_26_9']: score += 25 # MACD Kesişimi
             
-            # Sinyal Üretimi
-            eylem = "BEKLE"
-            if trend_durumu.startswith("📈") and last_rsi < 40:
-                eylem = "🔥 TREND LONG"
-            elif trend_durumu.startswith("📉") and last_rsi > 60:
-                eylem = "💥 TREND SHORT"
-            
-            # Trend Gücü Notu
-            guc_notu = "Zayıf"
-            if adx > 25: guc_notu = "Güçlü"
-            if adx > 40: guc_notu = "Çok Güçlü"
+            # Short için tam tersi
+            short_score = 0
+            if c < ema: short_score += 25
+            if st_dir == -1: short_score += 25
+            if rsi > 60: short_score += 25
+            if last['MACD_12_26_9'] < last['MACDs_12_26_9']: short_score += 25
+
+            # Eylem Belirleme
+            if score >= 75: eylem = "🚀 GÜÇLÜ LONG"
+            elif score == 50: eylem = "🟢 LONG"
+            elif short_score >= 75: eylem = "💥 GÜÇLÜ SHORT"
+            elif short_score == 50: eylem = "🔴 SHORT"
+            else: eylem = "⚪ BEKLE"
 
             rows.append({
                 "VARLIK": symbol,
-                "FİYAT": f"{last_close:.4f}",
-                "TREND YÖNÜ": trend_durumu,
-                "TREND GÜCÜ": guc_notu,
-                "EYLEM": eylem,
-                "RSI": int(last_rsi)
+                "FİYAT": f"{c:.4f}",
+                "TREND": "BOĞA" if c > ema else "AYI",
+                "SİNYAL GÜCÜ": f"%{max(score, short_score)}",
+                "İŞLEM EYLEMİ": eylem,
+                "TEKNİK": f"RSI:{int(rsi)} | ST:{'BOĞA' if st_dir==1 else 'AYI'}"
             })
-            time.sleep(0.1)
-        except:
-            continue
+            time.sleep(0.2)
+        except: continue
         progress.progress((idx + 1) / len(symbols))
     
     progress.empty()
     return pd.DataFrame(rows)
 
-# Stil Fonksiyonu
-def style_results(val):
-    if "LONG" in str(val): return 'background-color: #004d1a; color: white; font-weight: bold'
-    if "SHORT" in str(val): return 'background-color: #4d0000; color: white; font-weight: bold'
+# Görsel Stil
+def style_signal(val):
+    if "LONG" in str(val): return 'background-color: #0c3e1e; color: #52ff8f; font-weight: bold'
+    if "SHORT" in str(val): return 'background-color: #4b0a0a; color: #ff6e6e; font-weight: bold'
     return ''
 
-# Tabloyu Bas
-data = trend_ve_sinyal_analizi()
-
+# Uygulama Başlatma
+data = get_pro_signals()
 if not data.empty:
-    st.dataframe(
-        data.style.applymap(style_results, subset=['EYLEM']),
-        use_container_width=True,
-        height=600
-    )
+    st.dataframe(data.style.applymap(style_signal, subset=['İŞLEM EYLEMİ']), use_container_width=True, height=600)
 else:
-    st.error("Borsa verileri işlenirken bir hata oluştu.")
+    st.warning("Veriler işleniyor, lütfen sayfayı yenilemeyin...")
 
-if st.sidebar.button('🔄 Trendleri Tara'):
+if st.sidebar.button('🔄 Derin Analiz Yap'):
     st.rerun()
