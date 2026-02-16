@@ -5,9 +5,9 @@ import pandas_ta as ta
 import time
 
 # Sayfa Ayarları
-st.set_page_config(layout="wide", page_title="Quant Alpha | Final V10")
+st.set_page_config(layout="wide", page_title="Quant Alpha | Final V11")
 
-# Borsa Bağlantısı
+# Borsa Bağlantısı (KuCoin - Stabil)
 exchange = ccxt.kucoin({'enableRateLimit': True, 'timeout': 30000})
 
 st.markdown("# 🏛️ QUANT ALPHA: AKILLI ANALİZ TERMİNALİ")
@@ -83,7 +83,10 @@ def final_scanner():
     if not results:
         return pd.DataFrame()
     
-    return pd.DataFrame(results).sort_values(by='SKOR', ascending=False)
+    df_res = pd.DataFrame(results)
+    if 'SKOR' in df_res.columns:
+        return df_res.sort_values(by='SKOR', ascending=False)
+    return df_res
 
 # --- Arayüz Kontrolü ---
 if st.button('🎯 PİYASAYI ANALİZ ET'):
@@ -97,7 +100,7 @@ if st.button('🎯 PİYASAYI ANALİZ ET'):
             st.success(f"{len(signals)} adet fırsat yakalandı!")
             st.table(signals[['COIN', 'FİYAT', 'DURUM', 'RSI']])
         else:
-            st.warning("Şu an senin kriterlerine tam uyan (Trend + Kesişim) bir giriş sinyali yok.")
+            st.warning("⚠️ Şu an senin kriterlerine (Trend + Kesişim) tam uyan bir giriş sinyali yok.")
 
         # 2. Genel Sıralama (Gözlem Listesi)
         st.write("---")
