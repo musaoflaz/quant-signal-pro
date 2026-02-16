@@ -94,13 +94,14 @@ if st.button('🎯 PİYASAYI ANALİZ ET'):
     
     if not data.empty:
         # 1. Gerçek Sinyaller (Skor 90 olanlar)
-        signals = data[data['SKOR'] >= 80]
-        if not signals.empty:
-            st.subheader("🔥 KRİTERLERE TAM UYAN SİNYALLER")
-            st.success(f"{len(signals)} adet fırsat yakalandı!")
-            st.table(signals[['COIN', 'FİYAT', 'DURUM', 'RSI']])
-        else:
-            st.warning("⚠️ Şu an senin kriterlerine (Trend + Kesişim) tam uyan bir giriş sinyali yok.")
+        if 'SKOR' in data.columns:
+            signals = data[data['SKOR'] >= 80]
+            if not signals.empty:
+                st.subheader("🔥 KRİTERLERE TAM UYAN SİNYALLER")
+                st.success(f"{len(signals)} adet fırsat yakalandı!")
+                st.table(signals[['COIN', 'FİYAT', 'DURUM', 'RSI']])
+            else:
+                st.warning("⚠️ Şu an senin kriterlerine (Trend + Kesişim) tam uyan bir giriş sinyali yok.")
 
         # 2. Genel Sıralama (Gözlem Listesi)
         st.write("---")
