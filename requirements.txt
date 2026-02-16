@@ -2,6 +2,4 @@ streamlit
 pandas
 ccxt
 pandas_ta
-numba
 plotly
-
