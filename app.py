@@ -5,77 +5,76 @@ import pandas_ta as ta
 import time
 
 # Sayfa Ayarları
-st.set_page_config(layout="wide", page_title="Quant Pro | Alpha Sniper")
+st.set_page_config(layout="wide", page_title="Quant Pro | Anti-Block Terminal")
 
-# Borsa Bağlantısı
-exchange = ccxt.bybit({'enableRateLimit': True, 'timeout': 60000})
+# --- ENGELİ AŞMAK İÇİN KUCOIN BAĞLANTISI ---
+# KuCoin bulut sunucularına Bybit ve Binance'den daha fazla tolerans gösterir.
+exchange = ccxt.kucoin({
+    'enableRateLimit': True,
+    'timeout': 60000,
+    'options': {'adjustForTimeDifference': True}
+})
 
 st.markdown("# 🏛️ QUANT PRO - SİNYAL TERMİNALİ")
 st.write("---")
 
-symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'AVAX/USDT', 'SUI/USDT', 'PEPE/USDT']
+# KuCoin formatında varlık listesi
+symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'SUI/USDT']
 
 def pro_scanner():
     rows = []
-    
-    # --- İŞTE BEKLEMENİ ENGELLEYECEK GÖSTERGELER ---
-    status_text = st.empty() # Dinamik yazı alanı
-    progress_bar = st.progress(0) # İlerleme çubuğu
+    status_text = st.empty()
+    progress_bar = st.progress(0)
     
     for idx, symbol in enumerate(symbols):
-        # Hangi coin taranıyor göster
-        status_text.info(f"🔍 Şu an analiz ediliyor: **{symbol}** ({idx+1}/{len(symbols)})")
+        status_text.info(f"🔍 Analiz Ediliyor: **{symbol}**...")
         
         try:
-            bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
+            # KuCoin'den veri çekme
+            bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # Analizler (Trend + Momentum + Volatilite)
-            df['EMA200'] = ta.ema(df['c'], length=200)
+            # Teknik Göstergeler
+            df['EMA200'] = ta.ema(df['c'], length=100) # Daha hızlı tepki için 100
             df['RSI'] = ta.rsi(df['c'], length=14)
-            st_data = ta.supertrend(df['h'], df['l'], df['c'], length=10, multiplier=3)
-            df = pd.concat([df, st_data], axis=1)
             
             last = df.iloc[-1]
-            score = 0
-            # Long Şartları
-            if last['c'] > last['EMA200']: score += 25
-            if last['SUPERTd_10_3.0'] == 1: score += 25
-            if last['RSI'] < 45: score += 50
+            c, rsi, ema = last['c'], last['RSI'], last['EMA200']
             
-            # Short Şartları
+            # Sinyal Skoru
+            score = 0
+            if c > ema: score += 50  # Trend Boğa
+            if rsi < 40: score += 50 # Aşırı Satım
+            
             short_score = 0
-            if last['c'] < last['EMA200']: short_score += 25
-            if last['SUPERTd_10_3.0'] == -1: short_score += 25
-            if last['RSI'] > 55: short_score += 50
+            if c < ema: short_score += 50 # Trend Ayı
+            if rsi > 60: short_score += 50 # Aşırı Alım
 
             eylem = "⚪ BEKLE"
-            if score >= 75: eylem = "🚀 GÜÇLÜ LONG"
-            elif short_score >= 75: eylem = "💥 GÜÇLÜ SHORT"
+            if score >= 100: eylem = "🚀 GÜÇLÜ LONG"
+            elif short_score >= 100: eylem = "💥 GÜÇLÜ SHORT"
 
             rows.append({
                 "VARLIK": symbol,
-                "FİYAT": f"{last['c']:.4f}",
-                "TREND": "BOĞA" if last['c'] > last['EMA200'] else "AYI",
+                "FİYAT": f"{c:.4f}",
+                "TREND": "BOĞA" if c > ema else "AYI",
                 "GÜVEN": f"%{max(score, short_score)}",
                 "İŞLEM EYLEMİ": eylem
             })
             
-            # İlerleme çubuğunu güncelle
             progress_bar.progress((idx + 1) / len(symbols))
-            time.sleep(0.3) # API banlanmaması için
+            time.sleep(1) # Borsa bizi robot sanmasın diye bekliyoruz
             
         except Exception as e:
-            st.error(f"{symbol} hatası: {e}")
+            # Hata mesajını sadeleştirip kullanıcıya bildir
+            st.warning(f"⚠️ {symbol} için bağlantı denemesi başarısız. Diğerine geçiliyor.")
             continue
             
-    # Tarama bitince göstergeleri temizle
     status_text.empty()
     progress_bar.empty()
-    
     return pd.DataFrame(rows)
 
-# Tabloyu Renkli Bas
+# Renklendirme
 def style_action(val):
     if "LONG" in str(val): return 'background-color: #0c3e1e; color: #52ff8f; font-weight: bold'
     if "SHORT" in str(val): return 'background-color: #4b0a0a; color: #ff6e6e; font-weight: bold'
@@ -85,9 +84,8 @@ data = pro_scanner()
 
 if not data.empty:
     st.dataframe(data.style.applymap(style_action, subset=['İŞLEM EYLEMİ']), use_container_width=True)
-    st.success("✅ Tüm piyasa başarıyla tarandı!")
 else:
-    st.warning("Veri çekilemedi.")
+    st.error("❌ Tüm borsalar erişimi reddetti. Lütfen bir süre sonra tekrar deneyin.")
 
-if st.sidebar.button('🔄 Derin Analizi Başlat'):
+if st.sidebar.button('🔄 Yeniden Tara'):
     st.rerun()
