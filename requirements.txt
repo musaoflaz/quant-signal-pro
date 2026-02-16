@@ -1,7 +1,5 @@
 streamlit
-ccxt
 pandas
 numpy
 pandas_ta
-plotly
 requests
