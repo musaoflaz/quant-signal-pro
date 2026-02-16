@@ -4,41 +4,45 @@ import ccxt
 import pandas_ta as ta
 import time
 
-st.set_page_config(layout="wide", page_title="Quant Alpha | Mega Scanner")
+# Sayfa Ayarları
+st.set_page_config(layout="wide", page_title="Quant Alpha | Mega Scanner V7")
 
-# Borsa Bağlantısı
-exchange = ccxt.kucoin({'enableRateLimit': True, 'timeout': 60000})
+# Borsa Bağlantısı (Stabilite için optimize edildi)
+exchange = ccxt.kucoin({
+    'enableRateLimit': True, 
+    'timeout': 30000,
+    'options': {'adjustForTimeDifference': True}
+})
 
 st.markdown("# 🏛️ QUANT ALPHA: TOP 20 OPPORTUNITIES")
-st.info("Piyasa taranıyor, en yüksek skorlu 20 sinyal listeleniyor...")
+st.info("Piyasa taranıyor... En yüksek skorlu sinyaller listelenecek.")
 
-def get_top_symbols():
+def get_filtered_symbols():
     try:
-        markets = exchange.fetch_tickers()
-        # Sadece USDT çiftlerini ve hacmi yüksek olanları al
-        df_m = pd.DataFrame.from_dict(markets, orient='index')
-        df_m = df_m[df_m['symbol'].str.contains('/USDT')]
-        # En yüksek hacimli ilk 50-60 coini tara (Hız ve IP engeli için dengeli rakam)
-        top_hacim = df_m.sort_values('quoteVolume', ascending=False).head(60).index.tolist()
-        return top_hacim
+        tickers = exchange.fetch_tickers()
+        df_tickers = pd.DataFrame.from_dict(tickers, orient='index')
+        # Sadece USDT çiftleri ve hacmi en yüksek 40 coini al (Hız ve güvenlik dengesi)
+        df_tickers = df_tickers[df_tickers['symbol'].str.contains('/USDT')]
+        top_40 = df_tickers.sort_values('quoteVolume', ascending=False).head(40).index.tolist()
+        return top_40
     except:
-        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'SUI/USDT', 'AVAX/USDT']
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'AVAX/USDT', 'SUI/USDT', 'PEPE/USDT']
 
-def scan_and_score():
-    symbols = get_top_symbols()
-    all_results = []
+def alpha_scanner():
+    symbols = get_filtered_symbols()
+    results = []
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for idx, symbol in enumerate(symbols):
-        status_text.write(f"🔍 Analiz Ediliyor: {symbol}")
+        status_text.info(f"🔍 Analiz Ediliyor ({idx+1}/{len(symbols)}): **{symbol}**")
         try:
-            # Veri çekme (H1)
+            # Veri Çekme (H1)
             bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # Göstergeler
+            # --- PROFESYONEL İNDİKATÖR SETİ (Referans Modu) ---
             df['EMA200'] = ta.ema(df['c'], length=200)
             df['RSI'] = ta.rsi(df['c'], length=14)
             stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
@@ -48,43 +52,42 @@ def scan_and_score():
             last = df.iloc[-1]
             prev = df.iloc[-2]
             
-            # Değerler
-            c, rsi, ema = last['c'], last['RSI'], last['EMA200']
-            k, d = last['STOCHRSIk_14_14_3_3'], last['STOCHRSId_14_14_3_3']
-            pk, pd_val = prev['STOCHRSIk_14_14_3_3'], prev['STOCHRSId_14_14_3_3']
+            # --- SKORLAMA MOTORU ---
+            score = 0
+            yon = "NÖTR"
             
-            # --- SKORLAMA MANTIĞI ---
-            long_score = 0
-            short_score = 0
+            # Trend ve Momentum Onayı
+            ema_onay = last['c'] > last['EMA200']
+            stoch_cross_up = prev['STOCHRSIk_14_14_3_3'] < prev['STOCHRSId_14_14_3_3'] and last['STOCHRSIk_14_14_3_3'] > last['STOCHRSId_14_14_3_3']
+            stoch_cross_down = prev['STOCHRSIk_14_14_3_3'] > prev['STOCHRSId_14_14_3_3'] and last['STOCHRSIk_14_14_3_3'] < last['STOCHRSId_14_14_3_3']
             
-            # Trend Puanı
-            if c > ema: long_score += 30
-            else: short_score += 30
+            # LONG Skoru
+            if ema_onay: score += 30
+            if stoch_cross_up: score += 40
+            if last['RSI'] < 45: score += 20
+            if last['v'] > last['VOL_AVG']: score += 10
             
-            # Momentum Puanı (Kesişim)
-            if pk < pd_val and k > d: long_score += 40
-            if pk > pd_val and k < d: short_score += 40
-            
-            # RSI & Hacim Puanı
-            if rsi < 40: long_score += 20
-            if rsi > 60: short_score += 20
-            if last['v'] > last['VOL_AVG']: 
-                long_score += 10
-                short_score += 10
+            # SHORT Skoru (Eğer trend aşağıysa)
+            s_score = 0
+            if not ema_onay: s_score += 30
+            if stoch_cross_down: s_score += 40
+            if last['RSI'] > 55: s_score += 20
+            if last['v'] > last['VOL_AVG']: s_score += 10
 
-            final_score = long_score if long_score > short_score else short_score
-            yon = "LONG" if long_score > short_score else "SHORT"
+            final_score = score if score >= s_score else s_score
+            yon = "LONG" if score >= s_score else "SHORT"
             
-            all_results.append({
-                "SYMBOL": symbol,
-                "FİYAT": f"{c:.4f}",
-                "YÖN": yon,
-                "SKOR": final_score,
-                "RSI": int(rsi),
-                "VOL": "YÜKSEK" if last['v'] > last['VOL_AVG'] else "NORMAL"
-            })
+            if final_score >= 50: # Sadece kayda değer sinyalleri ekle
+                results.append({
+                    "SYMBOL": symbol,
+                    "FİYAT": f"{last['c']:.4f}",
+                    "YÖN": yon,
+                    "GÜVEN SKORU": final_score,
+                    "RSI": int(last['RSI']),
+                    "HACİM": "GÜÇLÜ" if last['v'] > last['VOL_AVG'] else "ZAYIF"
+                })
             
-            time.sleep(0.2) # Rate limit koruması
+            time.sleep(0.4) # API Ban koruması
         except:
             continue
         progress_bar.progress((idx + 1) / len(symbols))
@@ -92,28 +95,27 @@ def scan_and_score():
     status_text.empty()
     progress_bar.empty()
     
-    # Skorlara göre sırala ve en iyi 20'yi al
-    full_df = pd.DataFrame(all_results)
-    if not full_df.empty:
-        return full_df.sort_values('SKOR', ascending=False).head(20)
-    return full_df
+    # En yüksek skorlu 20 sinyali getir
+    res_df = pd.DataFrame(results)
+    if not res_df.empty:
+        return res_df.sort_values('GÜVEN SKORU', ascending=False).head(20)
+    return pd.DataFrame()
 
-# Tabloyu Renklendir
-def highlight_signals(s):
-    if s.YÖN == 'LONG' and s.SKOR >= 70:
-        return ['background-color: #11381b; color: #52ff8f']*len(s)
-    elif s.YÖN == 'SHORT' and s.SKOR >= 70:
-        return ['background-color: #3b0d0d; color: #ff6e6e']*len(s)
-    return ['']*len(s)
+# Görsel Stil
+def color_rows(row):
+    color = ''
+    if row['YÖN'] == 'LONG' and row['GÜVEN SKORU'] >= 70: color = 'background-color: #0c3e1e; color: #52ff8f'
+    elif row['YÖN'] == 'SHORT' and row['GÜVEN SKORU'] >= 70: color = 'background-color: #4b0a0a; color: #ff6e6e'
+    return [color]*len(row)
 
-# Sonuçları Göster
-top_20 = scan_and_score()
+# Tarayıcıyı Çalıştır
+top_20 = alpha_scanner()
 
 if not top_20.empty:
-    st.dataframe(top_20.style.apply(highlight_signals, axis=1), use_container_width=True, height=700)
-    st.success(f"✅ Piyasa tarandı. En potansiyelli {len(top_20)} sinyal yukarıda.")
+    st.dataframe(top_20.style.apply(color_rows, axis=1), use_container_width=True, height=650)
+    st.success(f"🎯 Tarama Tamamlandı. En yüksek olasılıklı {len(top_20)} sinyal listelendi.")
 else:
-    st.warning("Veri işlenirken hata oluştu veya piyasa çok stabil.")
+    st.warning("⚠️ Şu an kriterlere uygun güçlü bir sinyal bulunamadı. Lütfen 5 dk sonra tekrar deneyin.")
 
-if st.sidebar.button('🔄 Tüm Piyasayı Yeniden Tara'):
+if st.sidebar.button('🔄 Tüm Piyasayı Taramayı Başlat'):
     st.rerun()
