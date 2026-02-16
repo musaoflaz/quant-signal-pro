@@ -5,88 +5,89 @@ import pandas_ta as ta
 import time
 
 # Sayfa Ayarları
-st.set_page_config(layout="wide", page_title="Quant Pro | Ultimate Signal Alpha")
+st.set_page_config(layout="wide", page_title="Quant Pro | Alpha Sniper")
 
-# Borsa Bağlantısı (Bulut için en yüksek stabilite)
+# Borsa Bağlantısı
 exchange = ccxt.bybit({'enableRateLimit': True, 'timeout': 60000})
 
-st.markdown("# 🏛️ QUANT PRO - ULTIMATE TREND TRACKER")
+st.markdown("# 🏛️ QUANT PRO - SİNYAL TERMİNALİ")
 st.write("---")
 
 symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'AVAX/USDT', 'SUI/USDT', 'PEPE/USDT']
 
-def get_pro_signals():
+def pro_scanner():
     rows = []
-    progress = st.progress(0)
+    
+    # --- İŞTE BEKLEMENİ ENGELLEYECEK GÖSTERGELER ---
+    status_text = st.empty() # Dinamik yazı alanı
+    progress_bar = st.progress(0) # İlerleme çubuğu
     
     for idx, symbol in enumerate(symbols):
+        # Hangi coin taranıyor göster
+        status_text.info(f"🔍 Şu an analiz ediliyor: **{symbol}** ({idx+1}/{len(symbols)})")
+        
         try:
-            # Daha derin analiz için 200 mumluk veri (H1)
             bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # 1. Trend: EMA 200 & SuperTrend
+            # Analizler (Trend + Momentum + Volatilite)
             df['EMA200'] = ta.ema(df['c'], length=200)
+            df['RSI'] = ta.rsi(df['c'], length=14)
             st_data = ta.supertrend(df['h'], df['l'], df['c'], length=10, multiplier=3)
             df = pd.concat([df, st_data], axis=1)
             
-            # 2. Momentum: RSI & MACD
-            df['RSI'] = ta.rsi(df['c'], length=14)
-            macd = ta.macd(df['c'])
-            df = pd.concat([df, macd], axis=1)
-            
             last = df.iloc[-1]
-            c, rsi, ema = last['c'], last['RSI'], last['EMA200']
-            st_dir = last['SUPERTd_10_3.0'] # 1=Boğa, -1=Ayı
-            
-            # Gelişmiş Sinyal Skoru
             score = 0
-            if c > ema: score += 25  # Ana Trend Pozitif
-            if st_dir == 1: score += 25 # SuperTrend Pozitif
-            if rsi < 40: score += 25 # Aşırı Satım (Toplama Alanı)
-            if last['MACD_12_26_9'] > last['MACDs_12_26_9']: score += 25 # MACD Kesişimi
+            # Long Şartları
+            if last['c'] > last['EMA200']: score += 25
+            if last['SUPERTd_10_3.0'] == 1: score += 25
+            if last['RSI'] < 45: score += 50
             
-            # Short için tam tersi
+            # Short Şartları
             short_score = 0
-            if c < ema: short_score += 25
-            if st_dir == -1: short_score += 25
-            if rsi > 60: short_score += 25
-            if last['MACD_12_26_9'] < last['MACDs_12_26_9']: short_score += 25
+            if last['c'] < last['EMA200']: short_score += 25
+            if last['SUPERTd_10_3.0'] == -1: short_score += 25
+            if last['RSI'] > 55: short_score += 50
 
-            # Eylem Belirleme
+            eylem = "⚪ BEKLE"
             if score >= 75: eylem = "🚀 GÜÇLÜ LONG"
-            elif score == 50: eylem = "🟢 LONG"
             elif short_score >= 75: eylem = "💥 GÜÇLÜ SHORT"
-            elif short_score == 50: eylem = "🔴 SHORT"
-            else: eylem = "⚪ BEKLE"
 
             rows.append({
                 "VARLIK": symbol,
-                "FİYAT": f"{c:.4f}",
-                "TREND": "BOĞA" if c > ema else "AYI",
-                "SİNYAL GÜCÜ": f"%{max(score, short_score)}",
-                "İŞLEM EYLEMİ": eylem,
-                "TEKNİK": f"RSI:{int(rsi)} | ST:{'BOĞA' if st_dir==1 else 'AYI'}"
+                "FİYAT": f"{last['c']:.4f}",
+                "TREND": "BOĞA" if last['c'] > last['EMA200'] else "AYI",
+                "GÜVEN": f"%{max(score, short_score)}",
+                "İŞLEM EYLEMİ": eylem
             })
-            time.sleep(0.2)
-        except: continue
-        progress.progress((idx + 1) / len(symbols))
+            
+            # İlerleme çubuğunu güncelle
+            progress_bar.progress((idx + 1) / len(symbols))
+            time.sleep(0.3) # API banlanmaması için
+            
+        except Exception as e:
+            st.error(f"{symbol} hatası: {e}")
+            continue
+            
+    # Tarama bitince göstergeleri temizle
+    status_text.empty()
+    progress_bar.empty()
     
-    progress.empty()
     return pd.DataFrame(rows)
 
-# Görsel Stil
-def style_signal(val):
+# Tabloyu Renkli Bas
+def style_action(val):
     if "LONG" in str(val): return 'background-color: #0c3e1e; color: #52ff8f; font-weight: bold'
     if "SHORT" in str(val): return 'background-color: #4b0a0a; color: #ff6e6e; font-weight: bold'
     return ''
 
-# Uygulama Başlatma
-data = get_pro_signals()
-if not data.empty:
-    st.dataframe(data.style.applymap(style_signal, subset=['İŞLEM EYLEMİ']), use_container_width=True, height=600)
-else:
-    st.warning("Veriler işleniyor, lütfen sayfayı yenilemeyin...")
+data = pro_scanner()
 
-if st.sidebar.button('🔄 Derin Analiz Yap'):
+if not data.empty:
+    st.dataframe(data.style.applymap(style_action, subset=['İŞLEM EYLEMİ']), use_container_width=True)
+    st.success("✅ Tüm piyasa başarıyla tarandı!")
+else:
+    st.warning("Veri çekilemedi.")
+
+if st.sidebar.button('🔄 Derin Analizi Başlat'):
     st.rerun()
