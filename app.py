@@ -4,28 +4,22 @@ import ccxt
 import pandas_ta as ta
 import plotly.graph_objects as go
 
-# 1. SAYFA AYARLARI
+# 1. Konfigürasyon
 st.set_page_config(layout="wide", page_title="Quant Signal Pro V2")
 
-# 2. BINANCE BAĞLANTISI
-# Cloud üzerinde 'Rate Limit' hatası almamak için ayarlı
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
+# 2. Borsa Bağlantısı
+exchange = ccxt.binance({'enableRateLimit': True})
 
 def veri_getir(sembol='BTC/USDT'):
     try:
-        # Son 100 adet 1 saatlik mum verisi
         bars = exchange.fetch_ohlcv(sembol, timeframe='1h', limit=100)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['Tarih'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        # RSI Hesaplama (Mantık aynı kalıyor)
+        # Sinyal Hesaplama
         df['RSI'] = ta.rsi(df['close'], length=14)
         
-        # SINYAL MANTIĞI VE SÜTUN İSMİ SABİTLEME
-        # Hata veren 'İŞLEM EYLEMİ' yerine bulut dostu 'SINYAL' ismini kullandık
+        # Sütun ismi hatasını (KeyError) önlemek için sabit isim:
         df['SINYAL'] = 'BEKLE'
         df.loc[df['RSI'] < 30, 'SINYAL'] = 'AL'
         df.loc[df['RSI'] > 70, 'SINYAL'] = 'SAT'
@@ -34,7 +28,6 @@ def veri_getir(sembol='BTC/USDT'):
     except:
         return pd.DataFrame()
 
-# 3. RENKLENDİRME FONKSİYONU
 def sinyal_stili(val):
     if val == 'AL': return 'background-color: #00ff00; color: black; font-weight: bold'
     if val == 'SAT': return 'background-color: #ff0000; color: white; font-weight: bold'
@@ -43,34 +36,28 @@ def sinyal_stili(val):
 # --- ARAYÜZ ---
 st.title("📊 Quant Signal Pro")
 
-# Veriyi Çek
 df = veri_getir()
 
 tab1, tab2 = st.tabs(["🔍 Sinyal Tarayıcı", "📈 Analiz Grafiği"])
 
 with tab1:
     if not df.empty:
-        st.subheader("BTC/USDT Canlı Takip")
-        # En güncel veriyi en üste almak için ters çeviriyoruz (iloc[::-1])
+        # En güncel veriyi en üste alarak göster
         st.dataframe(
             df.iloc[::-1].style.applymap(sinyal_stili, subset=['SINYAL']),
             use_container_width=True,
             height=600
         )
     else:
-        st.error("Binance verileri şu an yüklenemiyor. Lütfen bekleyin...")
+        st.warning("Veriler yükleniyor, lütfen bekleyin...")
 
 with tab2:
     if not df.empty:
-        # Mum Grafiği (Candlestick)
         fig = go.Figure(data=[go.Candlestick(
-            x=df['Tarih'],
-            open=df['open'], high=df['high'],
-            low=df['low'], close=df['close']
+            x=df['Tarih'], open=df['open'], high=df['high'], low=df['low'], close=df['close']
         )])
         fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
-# Manuel Güncelleme Butonu
 if st.sidebar.button('Yeniden Tara'):
     st.rerun()
