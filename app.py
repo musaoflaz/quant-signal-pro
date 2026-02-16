@@ -3,88 +3,83 @@ import pandas as pd
 import ccxt
 import pandas_ta as ta
 
-# 1. SAYFA KONFİGÜRASYONU
-st.set_page_config(layout="wide", page_title="Quant Signal Pro | İşlem Terminali")
+# 1. Sayfa Ayarları (Geniş ekran)
+st.set_page_config(layout="wide", page_title="Quant Signal Pro | Multi-Exchange Terminal")
 
-# 2. BORSA BAĞLANTISI (Güvenli Mod)
-exchange = ccxt.binance({'enableRateLimit': True})
+# 2. ALTERNATİF BORSA BAĞLANTISI (Bybit)
+# Binance'de sorun varsa Bybit bulutta daha stabil çalışır.
+exchange = ccxt.bybit({'enableRateLimit': True})
 
-# 3. TASARIM VE BAŞLIK
-st.markdown("# 🏛️ TRADE TERMINAL")
+# 3. Başlık Tasarımı
+st.markdown("# 🏛️ TRADE TERMINAL (Multi-Exchange)")
+st.info("Veri Kaynağı: Bybit (Binance Alternatifi)")
 st.write("---")
 
-# Laptop görselindeki varlık listesi
+# Laptop görselindeki varlık listesi (Bybit uyumlu format)
 symbols = [
     'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT',
-    'PEPE/USDT', 'ZEC/USDT', 'BNB/USDT', 'SUI/USDT', 'ADA/USDT'
+    'PEPE/USDT', 'BNB/USDT', 'SUI/USDT', 'AVAX/USDT', 'LINK/USDT'
 ]
 
-def veri_isle():
-    terminal_rows = []
+def veri_analizi_yedek():
+    all_rows = []
     for symbol in symbols:
         try:
-            # 4 Saatlik (H4) Veriler
+            # 4 Saatlik (H4) veriler
             bars = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # RSI ve Fiyat
+            # RSI Hesaplama
             rsi = ta.rsi(df['c'], length=14).iloc[-1]
             last_price = df['c'].iloc[-1]
             
-            # Laptop görselindeki Sinyal Mantığı
+            # Lokalindeki Sinyal Mantığı
             if rsi < 35:
                 eylem = "🟢 AL (LONG)"
-                rejim = "TREND (TRENDING)"
+                rejim = "TREND (UP)"
                 guven = f"%{int(100-rsi)}"
             elif rsi > 65:
                 eylem = "🔴 SAT (SHORT)"
-                rejim = "TREND (TRENDING)"
+                rejim = "TREND (DOWN)"
                 guven = f"%{int(rsi)}"
             else:
                 eylem = "⚪ BEKLE"
                 rejim = "YATAY (RANGING)"
-                guven = "%40"
+                guven = "%45"
 
-            terminal_rows.append({
+            all_rows.append({
                 "VARLIK": symbol,
                 "FİYAT": f"{last_price:.4f}",
                 "PİYASA REJİMİ": rejim,
                 "İŞLEM EYLEMİ": eylem,
                 "GÜVEN %": guven,
-                "TEKNİK ANALİZ": f"H4 | RSI:{int(rsi)} | MACD+"
+                "TEKNİK ANALİZ": f"H4 | RSI:{int(rsi)}"
             })
-        except:
+        except Exception as e:
+            # Eğer bir borsa hata verirse diğerine geçmek için burayı kullanabiliriz
             continue
-    return pd.DataFrame(terminal_rows)
+    return pd.DataFrame(all_rows)
 
-# GÜVENLİ BOYAMA FONKSİYONU (Hata riskini sıfırlayan yöntem)
-def renklendir(row):
-    color_map = []
-    for val in row:
-        if "AL" in str(val):
-            color_map.append('background-color: #155724; color: #d4edda; font-weight: bold')
-        elif "SAT" in str(val):
-            color_map.append('background-color: #721c24; color: #f8d7da; font-weight: bold')
-        else:
-            color_map.append('')
-    return color_map
+# Renklendirme (Hata vermeyen güvenli metod)
+def style_apply(val):
+    if "AL" in str(val):
+        return 'background-color: #0c3e1e; color: #52ff8f; font-weight: bold'
+    if "SAT" in str(val):
+        return 'background-color: #4b0a0a; color: #ff6e6e; font-weight: bold'
+    return ''
 
-# ANA AKIŞ
-data = veri_isle()
+# Veriyi çek ve göster
+data = veri_analizi_yedek()
 
 if not data.empty:
-    # Sekmeler (Görseldeki gibi)
-    tab1, tab2 = st.tabs(["🔍 İŞLEM TARAYICI", "📊 ANALİZ MASASI"])
-    
-    with tab1:
-        # Görseldeki tablonun birebir kopyası
-        st.dataframe(
-            data.style.apply(renklendir, axis=1, subset=['İŞLEM EYLEMİ']),
-            use_container_width=True,
-            height=600
-        )
+    # Sütun ismini sabit kullanarak KeyError hatasını önlüyoruz
+    st.dataframe(
+        data.style.map(style_apply, subset=['İŞLEM EYLEMİ']),
+        use_container_width=True,
+        height=650
+    )
 else:
-    st.error("Veri çekilemedi. Lütfen Binance bağlantısını ve API durumunu kontrol edin.")
+    st.error("Alternatif borsalardan (Bybit/OKX) veri çekilemedi. Lütfen bağlantınızı kontrol edin.")
 
 # Manuel Yenileme
 if st.sidebar.button('Sinyalleri Yenile'):
