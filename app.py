@@ -4,78 +4,77 @@ import ccxt
 import pandas_ta as ta
 import time
 
-# 1. Sayfa Ayarları
-st.set_page_config(layout="wide", page_title="Quant Alpha | Smart Signal Filter")
+st.set_page_config(layout="wide", page_title="Quant Alpha | Smart Filter V9")
 
-# 2. Borsa Bağlantısı
+# 1. Borsa Bağlantısı (Stabil ve Hızlı)
 exchange = ccxt.kucoin({'enableRateLimit': True, 'timeout': 30000})
 
-st.markdown("# 🏛️ QUANT ALPHA: AKILLI SİNYAL FİLTRESİ")
-st.write("---")
+st.markdown("# 🏛️ QUANT ALPHA: AKILLI ANALİZ TERMİNALİ")
+st.info("Piyasa taranıyor... Sadece kriterlere tam uyanlar 'Sinyal' olarak listelenir.")
 
-def get_symbols():
+def get_best_symbols():
     try:
         tickers = exchange.fetch_tickers()
         df_t = pd.DataFrame.from_dict(tickers, orient='index')
         df_t = df_t[df_t['symbol'].str.contains('/USDT')]
-        # En hacimli 40 coin (Piyasayı temsil eder)
+        # En hacimli 40 coin (Piyasa yönünü belirleyen ana grup)
         return df_t.sort_values('quoteVolume', ascending=False).head(40).index.tolist()
     except:
-        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'SUI/USDT']
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'AVAX/USDT', 'SUI/USDT']
 
-def smart_scanner():
-    symbols = get_symbols()
-    results = []
+def deep_scanner():
+    symbols = get_best_symbols()
+    all_results = []
     
     progress = st.progress(0)
     status = st.empty()
     
     for idx, symbol in enumerate(symbols):
-        status.info(f"🔍 Kriter Denetimi Yapılıyor: **{symbol}**")
+        status.info(f"🔍 Kriter Kontrolü: **{symbol}**")
         try:
+            # 1 Saatlik Veri (Sinyal için)
             bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # --- TEKNİK ANALİZ ---
+            # --- TEKNİK ANALİZ MOTORU ---
             df['EMA200'] = ta.ema(df['c'], length=200)
             df['RSI'] = ta.rsi(df['c'], length=14)
             stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
             df = pd.concat([df, stoch], axis=1)
             
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
+            l, p = df.iloc[-1], df.iloc[-2]
             
-            # Değişkenler
-            c, rsi, ema = last['c'], last['RSI'], last['EMA200']
-            k, d = last['STOCHRSIk_14_14_3_3'], last['STOCHRSId_14_14_3_3']
-            pk, pd_val = prev['STOCHRSIk_14_14_3_3'], prev['STOCHRSId_14_14_3_3']
+            # Veriler
+            c, rsi, ema = l['c'], l['RSI'], l['EMA200']
+            k, d = l['STOCHRSIk_14_14_3_3'], l['STOCHRSId_14_14_3_3']
+            pk, pd_val = p['STOCHRSIk_14_14_3_3'], p['STOCHRSId_14_14_3_3']
             
-            # --- KRİTER DENETİMİ (Senin Referansın) ---
-            durum = "KRİTER DIŞI"
+            # --- ANALİZ VE SIRALAMA MANTIĞI ---
             skor = 0
+            etiket = "GÖZLEM"
             
-            # LONG KRİTERİ: Trend Üstü + Stoch Kesişimi
+            # 🚀 LONG ŞARTLARI (Kriter Onayı)
             if c > ema:
-                if pk < pd_val and k > d:
-                    durum = "🚀 GÜÇLÜ AL (LONG)"
+                if pk < pd_val and k > d: # Altın Kesişim
+                    etiket = "🚀 GÜÇLÜ AL (LONG)"
                     skor = 90
                 elif k > d:
-                    durum = "🟢 TREND YUKARI (GÖZLEM)"
+                    etiket = "🟢 TREND YUKARI"
                     skor = 60
             
-            # SHORT KRİTERİ: Trend Altı + Stoch Kesişimi
+            # 💥 SHORT ŞARTLARI (Kriter Onayı)
             elif c < ema:
-                if pk > pd_val and k < d:
-                    durum = "💥 GÜÇLÜ SAT (SHORT)"
+                if pk > pd_val and k < d: # Ölüm Kesişimi
+                    etiket = "💥 GÜÇLÜ SAT (SHORT)"
                     skor = 90
                 elif k < d:
-                    durum = "🔴 TREND AŞAĞI (GÖZLEM)"
+                    etiket = "🔴 TREND AŞAĞI"
                     skor = 60
 
-            results.append({
+            all_results.append({
                 "COIN": symbol,
                 "FİYAT": f"{c:.4f}",
-                "ANALİZ SONUCU": durum,
+                "DURUM": etiket,
                 "SKOR": skor,
                 "RSI": int(rsi)
             })
@@ -86,29 +85,31 @@ def smart_scanner():
     status.empty()
     progress.empty()
     
-    # Sonuçları listele (Önce en yüksek skorlar)
-    df_res = pd.DataFrame(results).sort_values('SKOR', ascending=False)
-    return df_res
+    return pd.DataFrame(all_results).sort_values('SKOR', ascending=False)
 
 # --- Arayüz ---
-if st.button('🎯 PİYASAYI TARA VE ANALİZ ET'):
-    data = smart_scanner()
+if st.button('🎯 PİYASAYI ANALİZ ET'):
+    data = deep_scanner()
     
     if not data.empty:
-        # Sinyalleri ayır (Kriterlere uyanlar ve uymayanlar)
-        guclu_sinyaller = data[data['SKOR'] >= 80]
-        gozlem_listesi = data[(data['SKOR'] < 80) & (data['SKOR'] > 0)]
-        
-        if not guclu_sinyaller.empty:
-            st.subheader("🔥 KRİTERLERE TAM UYAN SİNYALLER")
-            st.success(f"{len(guclu_sinyaller)} adet güçlü fırsat yakalandı!")
-            st.table(guclu_sinyaller)
+        # 1. Sinyal Bölümü (Skor >= 80 olanlar)
+        sinyaller = data[data['SKOR'] >= 80]
+        if not sinyaller.empty:
+            st.subheader("🔥 KRİTERLERE UYAN GÜÇLÜ SİNYALLER")
+            st.success("Bu coinler hem trend onayı hem de momentum kesişimi verdi!")
+            st.table(sinyaller[['COIN', 'FİYAT', 'DURUM', 'RSI']])
         else:
-            st.warning("Şu an kriterlerine (EMA + Stoch Kesişimi) tam uyan bir fırsat yok.")
+            st.warning("⚠️ Şu an kriterlere %100 uyan bir giriş fırsatı yok.")
 
-        if not gozlem_listesi.empty:
-            st.subheader("👀 GÖZLEM LİSTESİ (Potansiyel Trendler)")
-            st.dataframe(gozlem_listesi, use_container_width=True)
-            
+        # 2. Gözlem Bölümü
+        st.write("---")
+        st.subheader("👀 TÜM PİYASA SIRALAMASI (Gözlem Listesi)")
+        
+        def color_status(val):
+            if "AL" in str(val): return 'background-color: #0c3e1e; color: #52ff8f'
+            if "SAT" in str(val): return 'background-color: #4b0a0a; color: #ff6e6e'
+            return ''
+        
+        st.dataframe(data.style.applymap(color_status, subset=['DURUM']), use_container_width=True)
     else:
-        st.error("Veri çekilemedi, lütfen tekrar deneyin.")
+        st.error("Borsa verisi alınamadı.")
