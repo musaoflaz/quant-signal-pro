@@ -4,72 +4,73 @@ import ccxt
 import pandas_ta as ta
 import plotly.graph_objects as go
 
-# 1. Sayfa Konfigürasyonu (En üstte olmalı)
-st.set_page_config(layout="wide", page_title="Quant Signal Pro")
+# 1. SAYFA AYARLARI
+st.set_page_config(layout="wide", page_title="Quant Signal Pro V2")
 
-# 2. Borsa Bağlantısı (Hata almamak için limitli)
-exchange = ccxt.binance({'enableRateLimit': True})
+# 2. BINANCE BAĞLANTISI
+# Cloud üzerinde 'Rate Limit' hatası almamak için ayarlı
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
+})
 
-def get_crypto_data(symbol='BTC/USDT'):
+def veri_getir(sembol='BTC/USDT'):
     try:
-        # Veri çekme
-        bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+        # Son 100 adet 1 saatlik mum verisi
+        bars = exchange.fetch_ohlcv(sembol, timeframe='1h', limit=100)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['Tarih'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        # RSI Hesaplama
+        # RSI Hesaplama (Mantık aynı kalıyor)
         df['RSI'] = ta.rsi(df['close'], length=14)
         
-        # Sinyal Mantığı (En basit ve hatasız haliyle)
-        df['Sinyal'] = 'Bekle'
-        df.loc[df['RSI'] < 30, 'Sinyal'] = 'AL'
-        df.loc[df['RSI'] > 70, 'Sinyal'] = 'SAT'
+        # SINYAL MANTIĞI VE SÜTUN İSMİ SABİTLEME
+        # Hata veren 'İŞLEM EYLEMİ' yerine bulut dostu 'SINYAL' ismini kullandık
+        df['SINYAL'] = 'BEKLE'
+        df.loc[df['RSI'] < 30, 'SINYAL'] = 'AL'
+        df.loc[df['RSI'] > 70, 'SINYAL'] = 'SAT'
         
-        # Sadece ihtiyacımız olan sütunları alalım
-        return df[['Tarih', 'open', 'high', 'low', 'close', 'RSI', 'Sinyal']].dropna()
-    except Exception as e:
+        return df[['Tarih', 'open', 'high', 'low', 'close', 'RSI', 'SINYAL']].dropna()
+    except:
         return pd.DataFrame()
 
-# 3. Renklendirme Fonksiyonu (Bulut uyumlu)
-def color_signals(val):
-    color = ''
-    if val == 'AL': color = 'background-color: #00ff00; color: black'
-    elif val == 'SAT': color = 'background-color: #ff0000; color: white'
-    return color
+# 3. RENKLENDİRME FONKSİYONU
+def sinyal_stili(val):
+    if val == 'AL': return 'background-color: #00ff00; color: black; font-weight: bold'
+    if val == 'SAT': return 'background-color: #ff0000; color: white; font-weight: bold'
+    return ''
 
 # --- ARAYÜZ ---
-st.title("🚀 Quant Signal Pro (V2)")
+st.title("📊 Quant Signal Pro")
 
 # Veriyi Çek
-df = get_crypto_data()
+df = veri_getir()
 
-tab1, tab2 = st.tabs(["📊 Sinyal Tablosu", "📈 Teknik Grafik"])
+tab1, tab2 = st.tabs(["🔍 Sinyal Tarayıcı", "📈 Analiz Grafiği"])
 
 with tab1:
     if not df.empty:
-        st.subheader("BTC/USDT - 1 Saatlik Veriler")
-        # En güncel veriyi en üste alıyoruz
-        latest_df = df.iloc[::-1]
-        
-        # Tabloyu basıyoruz (Hatayı önlemek için subset belirttik)
+        st.subheader("BTC/USDT Canlı Takip")
+        # En güncel veriyi en üste almak için ters çeviriyoruz (iloc[::-1])
         st.dataframe(
-            latest_df.style.applymap(color_signals, subset=['Sinyal']),
+            df.iloc[::-1].style.applymap(sinyal_stili, subset=['SINYAL']),
             use_container_width=True,
             height=600
         )
     else:
-        st.error("Şu an Binance verilerine ulaşılamıyor. Lütfen sayfayı yenile.")
+        st.error("Binance verileri şu an yüklenemiyor. Lütfen bekleyin...")
 
 with tab2:
     if not df.empty:
+        # Mum Grafiği (Candlestick)
         fig = go.Figure(data=[go.Candlestick(
             x=df['Tarih'],
             open=df['open'], high=df['high'],
             low=df['low'], close=df['close']
         )])
-        fig.update_layout(xaxis_rangeslider_visible=False, template="plotly_dark")
+        fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
-# Manuel Yenileme
-if st.sidebar.button('Verileri Güncelle'):
+# Manuel Güncelleme Butonu
+if st.sidebar.button('Yeniden Tara'):
     st.rerun()
