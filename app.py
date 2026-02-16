@@ -17,10 +17,11 @@ def get_symbols():
     try:
         tickers = exchange.fetch_tickers()
         df_t = pd.DataFrame.from_dict(tickers, orient='index')
+        # Sadece USDT çiftleri ve hacmi en yüksek 40 coini al
         df_t = df_t[df_t['symbol'].str.contains('/USDT')]
         return df_t.sort_values('quoteVolume', ascending=False).head(40).index.tolist()
     except:
-        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT']
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'AVAX/USDT']
 
 def final_scanner():
     symbols = get_symbols()
@@ -43,7 +44,7 @@ def final_scanner():
             
             l, p = df.iloc[-1], df.iloc[-2]
             
-            # --- KRİTERLER (Senin Referansın) ---
+            # --- KRİTERLER (Senin Lokal Başarı Referansın) ---
             score = 0
             label = "GÖZLEM"
             
@@ -78,6 +79,7 @@ def final_scanner():
     status.empty()
     progress.empty()
     
+    # Boş liste kontrolü (KeyError'u engelleyen kritik nokta)
     if not results:
         return pd.DataFrame()
     
@@ -92,18 +94,19 @@ if st.button('🎯 PİYASAYI ANALİZ ET'):
         signals = data[data['SKOR'] >= 80]
         if not signals.empty:
             st.subheader("🔥 KRİTERLERE TAM UYAN SİNYALLER")
+            st.success(f"{len(signals)} adet fırsat yakalandı!")
             st.table(signals[['COIN', 'FİYAT', 'DURUM', 'RSI']])
         else:
             st.warning("Şu an senin kriterlerine tam uyan (Trend + Kesişim) bir giriş sinyali yok.")
 
-        # 2. Genel Sıralama
+        # 2. Genel Sıralama (Gözlem Listesi)
         st.write("---")
-        st.subheader("👀 TÜM PİYASA DURUMU")
+        st.subheader("👀 TÜM PİYASA DURUMU (TOP 20)")
         
         def color_map(val):
             if "GÜÇLÜ" in str(val): return 'background-color: #1a4d2e; color: #52ff8f; font-weight: bold'
             return ''
         
-        st.dataframe(data.style.applymap(color_map, subset=['DURUM']), use_container_width=True)
+        st.dataframe(data.head(20).style.applymap(color_map, subset=['DURUM']), use_container_width=True)
     else:
-        st.error("Veriler alınırken bir sorun oluştu. Lütfen tekrar deneyin.")
+        st.error("Veriler alınırken bir sorun oluştu veya borsa yanıt vermedi. Lütfen tekrar deneyin.")
