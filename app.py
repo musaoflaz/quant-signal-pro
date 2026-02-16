@@ -2,62 +2,67 @@ import streamlit as st
 import pandas as pd
 import ccxt
 import pandas_ta as ta
-import plotly.graph_objects as go
 
-# 1. Konfigürasyon
-st.set_page_config(layout="wide", page_title="Quant Signal Pro V2")
+# 1. Sayfa Ayarları
+st.set_page_config(layout="wide", page_title="Quant Signal Pro | Terminal")
 
 # 2. Borsa Bağlantısı
 exchange = ccxt.binance({'enableRateLimit': True})
 
-def veri_getir(sembol='BTC/USDT'):
-    try:
-        bars = exchange.fetch_ohlcv(sembol, timeframe='1h', limit=100)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['Tarih'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        # Sinyal Hesaplama
-        df['RSI'] = ta.rsi(df['close'], length=14)
-        
-        # Sütun ismi hatasını (KeyError) önlemek için sabit isim:
-        df['SINYAL'] = 'BEKLE'
-        df.loc[df['RSI'] < 30, 'SINYAL'] = 'AL'
-        df.loc[df['RSI'] > 70, 'SINYAL'] = 'SAT'
-        
-        return df[['Tarih', 'open', 'high', 'low', 'close', 'RSI', 'SINYAL']].dropna()
-    except:
-        return pd.DataFrame()
+# 3. Başlık
+st.markdown("# 🏛️ TRADE TERMINAL (Hız Modu)")
+st.write("---")
 
-def sinyal_stili(val):
-    if val == 'AL': return 'background-color: #00ff00; color: black; font-weight: bold'
-    if val == 'SAT': return 'background-color: #ff0000; color: white; font-weight: bold'
-    return ''
+# Takip edilecek varlıklar
+symbols = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT',
+    'PEPE/USDT', 'BNB/USDT', 'SUI/USDT', 'AVAX/USDT', 'LINK/USDT'
+]
 
-# --- ARAYÜZ ---
-st.title("📊 Quant Signal Pro")
+def veri_topla():
+    rows = []
+    for symbol in symbols:
+        try:
+            # 4 Saatlik veriler
+            bars = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50)
+            df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            
+            # RSI Hesaplama
+            rsi = ta.rsi(df['c'], length=14).iloc[-1]
+            fiyat = df['c'].iloc[-1]
+            
+            # Sinyal Mantığı (Sadece Metin)
+            if rsi < 35:
+                eylem = "AL (LONG)"
+                rejim = "YUKARI TREND"
+            elif rsi > 65:
+                eylem = "SAT (SHORT)"
+                rejim = "AŞAĞI TREND"
+            else:
+                eylem = "BEKLE"
+                rejim = "YATAY PİYASA"
 
-df = veri_getir()
+            rows.append({
+                "VARLIK": symbol,
+                "FİYAT": f"{fiyat:.4f}",
+                "PİYASA REJİMİ": rejim,
+                "İŞLEM EYLEMİ": eylem,
+                "GÜVEN %": f"%{int(abs(50-rsi)*2)}",
+                "RSI": int(rsi)
+            })
+        except:
+            continue
+    return pd.DataFrame(rows)
 
-tab1, tab2 = st.tabs(["🔍 Sinyal Tarayıcı", "📈 Analiz Grafiği"])
+# Veriyi çek ve göster
+data = veri_topla()
 
-with tab1:
-    if not df.empty:
-        # En güncel veriyi en üste alarak göster
-        st.dataframe(
-            df.iloc[::-1].style.applymap(sinyal_stili, subset=['SINYAL']),
-            use_container_width=True,
-            height=600
-        )
-    else:
-        st.warning("Veriler yükleniyor, lütfen bekleyin...")
+if not data.empty:
+    # Boyama/Style olmadan doğrudan tabloyu basıyoruz
+    st.dataframe(data, use_container_width=True, height=600)
+else:
+    st.error("Veri alınamadı, Binance bağlantısı kontrol ediliyor...")
 
-with tab2:
-    if not df.empty:
-        fig = go.Figure(data=[go.Candlestick(
-            x=df['Tarih'], open=df['open'], high=df['high'], low=df['low'], close=df['close']
-        )])
-        fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-if st.sidebar.button('Yeniden Tara'):
+# Manuel Yenileme
+if st.sidebar.button('Sinyalleri Güncelle'):
     st.rerun()
