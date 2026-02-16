@@ -4,60 +4,72 @@ import ccxt
 import pandas_ta as ta
 import plotly.graph_objects as go
 
-# Sayfa ayarları
+# 1. Sayfa Konfigürasyonu (En üstte olmalı)
 st.set_page_config(layout="wide", page_title="Quant Signal Pro")
 
-# Binance bağlantısı (Hız limitleri için korumalı)
+# 2. Borsa Bağlantısı (Hata almamak için limitli)
 exchange = ccxt.binance({'enableRateLimit': True})
 
-def fetch_data(symbol='BTC/USDT', timeframe='1h'):
+def get_crypto_data(symbol='BTC/USDT'):
     try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+        # Veri çekme
+        bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['Tarih'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        # RSI Sinyal Hesaplama
+        # RSI Hesaplama
         df['RSI'] = ta.rsi(df['close'], length=14)
         
-        # HATA ALAN SÜTUN İSMİNİ BURADA TANIMLIYORUZ:
-        # İsmi güvenli olması için 'SINYAL' yapıyoruz
-        df['SINYAL'] = 'BEKLE'
-        df.loc[df['RSI'] < 30, 'SINYAL'] = 'AL'
-        df.loc[df['RSI'] > 70, 'SINYAL'] = 'SAT'
+        # Sinyal Mantığı (En basit ve hatasız haliyle)
+        df['Sinyal'] = 'Bekle'
+        df.loc[df['RSI'] < 30, 'Sinyal'] = 'AL'
+        df.loc[df['RSI'] > 70, 'Sinyal'] = 'SAT'
         
-        return df.dropna()
-    except:
+        # Sadece ihtiyacımız olan sütunları alalım
+        return df[['Tarih', 'open', 'high', 'low', 'close', 'RSI', 'Sinyal']].dropna()
+    except Exception as e:
         return pd.DataFrame()
 
-def style_color(val):
-    if val == 'AL': return 'background-color: green; color: white'
-    if val == 'SAT': return 'background-color: red; color: white'
-    return ''
+# 3. Renklendirme Fonksiyonu (Bulut uyumlu)
+def color_signals(val):
+    color = ''
+    if val == 'AL': color = 'background-color: #00ff00; color: black'
+    elif val == 'SAT': color = 'background-color: #ff0000; color: white'
+    return color
 
-st.title("📊 Quant Signal Pro")
+# --- ARAYÜZ ---
+st.title("🚀 Quant Signal Pro (V2)")
 
-tab1, tab2 = st.tabs(["🔍 İŞLEM TARAYICI", "📈 ANALİZ MASASI"])
+# Veriyi Çek
+df = get_crypto_data()
+
+tab1, tab2 = st.tabs(["📊 Sinyal Tablosu", "📈 Teknik Grafik"])
 
 with tab1:
-    df = fetch_data()
     if not df.empty:
-        try:
-            # Sütun ismini 'SINYAL' olarak güncelleyerek renklendirme yapıyoruz
-            st.dataframe(df.iloc[::-1].style.applymap(style_color, subset=['SINYAL']), height=600, use_container_width=True)
-        except:
-            # Eğer yine bir görsel hata olursa tabloyu sade göster, çökme
-            st.dataframe(df.iloc[::-1], height=600, use_container_width=True)
+        st.subheader("BTC/USDT - 1 Saatlik Veriler")
+        # En güncel veriyi en üste alıyoruz
+        latest_df = df.iloc[::-1]
+        
+        # Tabloyu basıyoruz (Hatayı önlemek için subset belirttik)
+        st.dataframe(
+            latest_df.style.applymap(color_signals, subset=['Sinyal']),
+            use_container_width=True,
+            height=600
+        )
     else:
-        st.warning("Veri çekilemedi. Binance bağlantısı bekleniyor...")
-        if st.button('Yeniden Dene'):
-            st.rerun()
+        st.error("Şu an Binance verilerine ulaşılamıyor. Lütfen sayfayı yenile.")
 
 with tab2:
     if not df.empty:
         fig = go.Figure(data=[go.Candlestick(
-            x=df['timestamp'], 
-            open=df['open'], high=df['high'], 
+            x=df['Tarih'],
+            open=df['open'], high=df['high'],
             low=df['low'], close=df['close']
         )])
-        fig.update_layout(xaxis_rangeslider_visible=False, title="BTC/USDT Mum Grafiği")
+        fig.update_layout(xaxis_rangeslider_visible=False, template="plotly_dark")
         st.plotly_chart(fig, use_container_width=True)
+
+# Manuel Yenileme
+if st.sidebar.button('Verileri Güncelle'):
+    st.rerun()
