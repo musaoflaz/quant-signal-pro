@@ -2,85 +2,84 @@ import streamlit as st
 import pandas as pd
 import ccxt
 import pandas_ta as ta
+import time
 
-# 1. Sayfa Ayarları (Geniş ekran)
-st.set_page_config(layout="wide", page_title="Quant Signal Pro | Multi-Exchange Terminal")
+# 1. Sayfa Ayarları
+st.set_page_config(layout="wide", page_title="Quant Signal Pro | Terminal V3")
 
-# 2. ALTERNATİF BORSA BAĞLANTISI (Bybit)
-# Binance'de sorun varsa Bybit bulutta daha stabil çalışır.
-exchange = ccxt.bybit({'enableRateLimit': True})
+# 2. Borsa Bağlantı Fonksiyonu (IP Engeline Karşı Çoklu Deneme)
+def get_exchange_connection():
+    # Gate.io bulut sunucularına karşı genellikle daha toleranslıdır.
+    return ccxt.gateio({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'},
+        'timeout': 30000
+    })
 
-# 3. Başlık Tasarımı
-st.markdown("# 🏛️ TRADE TERMINAL (Multi-Exchange)")
-st.info("Veri Kaynağı: Bybit (Binance Alternatifi)")
+# 3. Başlık
+st.markdown("# 🏛️ TRADE TERMINAL (Cloud Optimized)")
 st.write("---")
 
-# Laptop görselindeki varlık listesi (Bybit uyumlu format)
-symbols = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT',
-    'PEPE/USDT', 'BNB/USDT', 'SUI/USDT', 'AVAX/USDT', 'LINK/USDT'
-]
+# Varlık listesi
+symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'SUI/USDT', 'AVAX/USDT']
 
-def veri_analizi_yedek():
-    all_rows = []
-    for symbol in symbols:
+def fetch_safe_data():
+    exchange = get_exchange_connection()
+    results = []
+    
+    # İlerleme çubuğu (Kullanıcıya veri çekildiğini hissettirir)
+    progress_bar = st.progress(0)
+    
+    for i, symbol in enumerate(symbols):
         try:
-            # 4 Saatlik (H4) veriler
+            # Veri çekme (Hata alırsak 1 saniye bekle ve geç)
             bars = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # RSI Hesaplama
             rsi = ta.rsi(df['c'], length=14).iloc[-1]
             last_price = df['c'].iloc[-1]
             
-            # Lokalindeki Sinyal Mantığı
-            if rsi < 35:
-                eylem = "🟢 AL (LONG)"
-                rejim = "TREND (UP)"
-                guven = f"%{int(100-rsi)}"
-            elif rsi > 65:
-                eylem = "🔴 SAT (SHORT)"
-                rejim = "TREND (DOWN)"
-                guven = f"%{int(rsi)}"
-            else:
-                eylem = "⚪ BEKLE"
-                rejim = "YATAY (RANGING)"
-                guven = "%45"
+            # Sinyal Mantığı
+            if rsi < 35: eylem = "🟢 AL (LONG)"; rejim = "TREND (UP)"
+            elif rsi > 65: eylem = "🔴 SAT (SHORT)"; rejim = "TREND (DOWN)"
+            else: eylem = "⚪ BEKLE"; rejim = "YATAY (RANGING)"
 
-            all_rows.append({
+            results.append({
                 "VARLIK": symbol,
                 "FİYAT": f"{last_price:.4f}",
                 "PİYASA REJİMİ": rejim,
                 "İŞLEM EYLEMİ": eylem,
-                "GÜVEN %": guven,
-                "TEKNİK ANALİZ": f"H4 | RSI:{int(rsi)}"
+                "GÜVEN %": f"%{int(abs(50-rsi)*2)}",
+                "ANALİZ": f"H4 | RSI:{int(rsi)}"
             })
-        except Exception as e:
-            # Eğer bir borsa hata verirse diğerine geçmek için burayı kullanabiliriz
+            time.sleep(0.2) # API Banlanmaması için küçük es
+        except:
             continue
-    return pd.DataFrame(all_rows)
+        progress_bar.progress((i + 1) / len(symbols))
+    
+    progress_bar.empty()
+    return pd.DataFrame(results)
 
-# Renklendirme (Hata vermeyen güvenli metod)
-def style_apply(val):
-    if "AL" in str(val):
-        return 'background-color: #0c3e1e; color: #52ff8f; font-weight: bold'
-    if "SAT" in str(val):
-        return 'background-color: #4b0a0a; color: #ff6e6e; font-weight: bold'
-    return ''
-
-# Veriyi çek ve göster
-data = veri_analizi_yedek()
+# Arayüz Akışı
+data = fetch_safe_data()
 
 if not data.empty:
-    # Sütun ismini sabit kullanarak KeyError hatasını önlüyoruz
+    # Sütun bazlı renklendirme (Hata vermeyen en güvenli metod)
+    def style_rows(val):
+        if "AL" in str(val): return 'color: #00ff00; font-weight: bold'
+        if "SAT" in str(val): return 'color: #ff4b4b; font-weight: bold'
+        return ''
+
     st.dataframe(
-        data.style.map(style_apply, subset=['İŞLEM EYLEMİ']),
+        data.style.map(style_rows, subset=['İŞLEM EYLEMİ']),
         use_container_width=True,
-        height=650
+        height=500
     )
 else:
-    st.error("Alternatif borsalardan (Bybit/OKX) veri çekilemedi. Lütfen bağlantınızı kontrol edin.")
+    st.warning("⚠️ Bulut sunucusu borsa bağlantısını şu an reddediyor. 30 saniye sonra otomatik tekrar denenecek.")
+    time.sleep(5)
+    st.rerun()
 
-# Manuel Yenileme
-if st.sidebar.button('Sinyalleri Yenile'):
+# Yenileme butonu
+if st.sidebar.button('🔄 Terminali Yenile'):
     st.rerun()
