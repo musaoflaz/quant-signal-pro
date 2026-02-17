@@ -2,10 +2,3 @@ streamlit
 pandas
 numpy
 ccxt
-python-telegram-bot
-ta
-requests
-schedule
-pytz
-numba
-llvmlite
