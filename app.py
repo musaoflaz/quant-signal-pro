@@ -5,37 +5,37 @@ from datetime import datetime
 import pytz
 
 # --- AYARLAR ---
-# Coin listesini Binance formatına göre güncelledik
+# Kucoin formatında coin listesi
 COINLER = ['BTC/USDT', 'ETH/USDT', 'NEAR/USDT', 'SOL/USDT', 'AVAX/USDT', 'LINK/USDT']
 
-st.set_page_config(page_title="Sniper Bot Analiz", layout="wide")
-st.title("🎯 Long/Short Skor Tablosu")
+st.set_page_config(page_title="Sniper Bot Kucoin", layout="wide")
+st.title("🎯 Kucoin Long/Short Skor Tablosu")
 
-# --- ANALİZ FONKSİYONU ---
+# --- ANALİZ FONKSİYONU (Kucoin Özel) ---
 def analiz_yap():
     sonuclar = []
-    # Borsaya daha sağlam bir bağlantı açıyoruz
-    exchange = ccxt.binance({
+    # Borsayı KUCOIN olarak ayarlıyoruz
+    exchange = ccxt.kucoin({
         'enableRateLimit': True,
         'options': {'defaultType': 'spot'}
     })
     
-    with st.spinner('Binance verileri çekiliyor...'):
+    with st.spinner('Kucoin verileri çekiliyor...'):
         for coin in COINLER:
             try:
-                # Veriyi çek ve DataFrame'e yükle
+                # Kucoin'den 1 saatlik verileri çek
                 ohlcv = exchange.fetch_ohlcv(coin, timeframe='1h', limit=10)
                 if not ohlcv:
                     continue
                     
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
-                # Fiyat ve Değişim Hesapla
+                # Fiyat ve Skorlama Hesapları
                 son_fiyat = df['close'].iloc[-1]
                 onceki_fiyat = df['close'].iloc[-2]
                 degisim = ((son_fiyat - onceki_fiyat) / onceki_fiyat) * 100
                 
-                # Skorlama Mantığı
+                # Senin o başarılı skorlama mantığın
                 if degisim > 0:
                     skor = f"{int(70 + (degisim * 10))} (LONG) ✅"
                 else:
@@ -48,19 +48,21 @@ def analiz_yap():
                     "Skor/Yön": skor
                 })
             except Exception as e:
-                st.warning(f"{coin} verisi çekilemedi: {e}")
+                st.warning(f"{coin} çekilemedi (Kucoin): {e}")
                 continue
                 
     return pd.DataFrame(sonuclar)
 
 # --- ANA EKRAN ---
+st.sidebar.info("Borsa: Kucoin")
 st.write(f"Sistem Saati: {datetime.now(pytz.timezone('Europe/Istanbul')).strftime('%H:%M:%S')}")
 
 if st.button("🚀 ANALİZİ BAŞLAT"):
     df_sonuc = analiz_yap()
     
     if not df_sonuc.empty:
+        # Senin sevdiğin o temiz tablo
         st.table(df_sonuc)
-        st.success("Analiz başarıyla tamamlandı!")
+        st.success("Kucoin skorları başarıyla güncellendi!")
     else:
-        st.error("Hiçbir veri çekilemedi. Lütfen internet bağlantısını veya coin isimlerini kontrol edin.")
+        st.error("Veri çekme hatası! Lütfen Kucoin bağlantısını kontrol edin.")
