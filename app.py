@@ -4,97 +4,114 @@ import ccxt
 import pandas_ta as ta
 import time
 
-st.set_page_config(layout="wide", page_title="Quant Alpha | Trade Commands")
+st.set_page_config(layout="wide", page_title="Alpha Sniper | Pro-Confirmation")
 
-# Borsa Bağlantısı
-exchange = ccxt.kucoin({'enableRateLimit': True, 'timeout': 60000})
+# Binance Futures Bağlantısı
+exchange = ccxt.binance({
+    'enableRateLimit': True, 
+    'options': {'defaultType': 'future'},
+    'timeout': 60000
+})
 
-st.markdown("# 🏛️ QUANT ALPHA: İŞLEM TERMİNALİ")
-st.write("---")
+st.markdown("# 🏛️ QUANT ALPHA: AĞIR ANALİZ (MULTI-CONFIRM)")
+st.info("Sistem her coini H4 ve H1 zaman dilimlerinde çapraz kontrole alıyor. Bu işlem biraz zaman alır ama daha güvenlidir.")
 
-def get_symbols():
+def get_pro_symbols():
     try:
+        # Sadece hacmi en yüksek ilk 25 coini al (Kalite > Nicelik)
         tickers = exchange.fetch_tickers()
         df_t = pd.DataFrame.from_dict(tickers, orient='index')
-        df_t = df_t[df_t['symbol'].str.contains('/USDT')]
-        return df_t.sort_values('quoteVolume', ascending=False).head(30).index.tolist()
+        df_t = df_t[df_t['symbol'].str.contains('USDT')]
+        return df_t.sort_values('quoteVolume', ascending=False).head(25).index.tolist()
     except:
         return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
 
-def command_scanner():
-    symbols = get_symbols()
+def heavy_pro_scanner():
+    symbols = get_pro_symbols()
     results = []
     progress = st.progress(0)
+    status = st.empty()
     
     for idx, symbol in enumerate(symbols):
+        status.info(f"🛡️ Derin Analiz Yapılıyor: **{symbol}**")
         try:
-            bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=250)
-            df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            # 1. KATMAN: H4 (4 Saatlik) ANA TREND KONTROLÜ
+            bars_h4 = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=200)
+            df_h4 = pd.DataFrame(bars_h4, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            ema200_h4 = ta.ema(df_h4['c'], length=200).iloc[-1]
+            last_c = df_h4['c'].iloc[-1]
             
-            # İndikatörler
-            df['EMA200'] = ta.ema(df['c'], length=200)
-            stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
-            df = pd.concat([df, stoch], axis=1)
+            ana_trend = "UP" if last_c > ema200_h4 else "DOWN"
+
+            # 2. KATMAN: H1 (1 Saatlik) SİNYAL KONTROLÜ
+            bars_h1 = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
+            df_h1 = pd.DataFrame(bars_h1, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            l, p = df.iloc[-1], df.iloc[-2]
+            # Göstergeler (H1)
+            stoch = ta.stochrsi(df_h1['c'], length=14, rsi_length=14, k=3, d=3)
+            df_h1 = pd.concat([df_h1, stoch], axis=1)
+            rsi = ta.rsi(df_h1['c'], length=14).iloc[-1]
+            vol_avg = df_h1['v'].rolling(20).mean().iloc[-1]
+            
+            l_h1, p_h1 = df_h1.iloc[-1], df_h1.iloc[-2]
             sk, sd = "STOCHRSIk_14_14_3_3", "STOCHRSId_14_14_3_3"
             
-            # --- NET KOMUT MANTIĞI ---
-            komut = "⌛ BEKLE"
-            aciklama = "Sinyal Bekleniyor"
-            renk_kodu = 0 # 0:Nötr, 1:Long, 2:Short
+            # --- GARANTİ SKOR HESAPLAMA ---
+            final_skor = 0
+            komut = "BEKLE"
             
-            # LONG Şartı: EMA Üstü + Stoch Yukarı Kesişim
-            if l['c'] > l['EMA200']:
-                if p[sk] < p[sd] and l[sk] > l[sd]:
-                    komut = "🚀 LONG (ALIM YAP)"
-                    aciklama = "Trend Pozitif + Alım Kesişimi Geldi"
-                    renk_kodu = 1
-                else:
-                    komut = "📈 LONG YÖNLÜ İZLE"
-                    aciklama = "Fiyat EMA200 üzerinde, kesişim bekleniyor"
-            
-            # SHORT Şartı: EMA Altı + Stoch Aşağı Kesişim
-            elif l['c'] < l['EMA200']:
-                if p[sk] > p[sd] and l[sk] < l[sd]:
-                    komut = "💥 SHORT (SATIŞ YAP)"
-                    aciklama = "Trend Negatif + Satış Kesişimi Geldi"
-                    renk_kodu = 2
-                else:
-                    komut = "📉 SHORT YÖNLÜ İZLE"
-                    aciklama = "Fiyat EMA200 altında, kesişim bekleniyor"
+            # LONG İÇİN ÇOKLU ONAY
+            if ana_trend == "UP":
+                final_skor += 40 # Ana trend yönünde puan
+                if p_h1[sk] < p_h1[sd] and l_h1[sk] > l_h1[sd]: # Kesişim
+                    final_skor += 40
+                if l_h1['v'] > vol_avg: # Hacim Onayı
+                    final_skor += 10
+                if rsi < 65: # Aşırı alım değilse
+                    final_skor += 10
+                
+                if final_skor >= 80: komut = "🚀 GÜÇLÜ LONG"
+                elif final_skor >= 50: komut = "📈 LONG TAKİP"
+
+            # SHORT İÇİN ÇOKLU ONAY
+            elif ana_trend == "DOWN":
+                final_skor += 40
+                if p_h1[sk] > p_h1[sd] and l_h1[sk] < l_h1[sd]:
+                    final_skor += 40
+                if l_h1['v'] > vol_avg:
+                    final_skor += 10
+                if rsi > 35:
+                    final_skor += 10
+                
+                if final_skor >= 80: komut = "💥 GÜÇLÜ SHORT"
+                elif final_skor >= 50: komut = "📉 SHORT TAKİP"
 
             results.append({
                 "COIN": symbol,
-                "FİYAT": f"{l['c']:.4f}",
-                "EYLEM / KOMUT": komut,
-                "NEDEN": aciklama,
-                "RENK": renk_kodu
+                "FİYAT": f"{l_h1['c']:.4f}",
+                "KOMUT": komut,
+                "GÜVEN SKORU": final_skor,
+                "TREND (H4)": ana_trend,
+                "HACİM": "YÜKSEK" if l_h1['v'] > vol_avg else "NORMAL"
             })
-            time.sleep(0.4)
+            time.sleep(0.5) # Ağır döngü, borsa koruması
         except: continue
         progress.progress((idx + 1) / len(symbols))
     
-    return pd.DataFrame(results)
+    status.empty()
+    return pd.DataFrame(results).sort_values('GÜVEN SKORU', ascending=False)
 
-# --- Arayüz ve Görselleştirme ---
-if st.button('🎯 PİYASAYI TARA VE KOMUTLARI AL'):
-    data = command_scanner()
+# --- Arayüz ---
+if st.button('🛡️ DERİN ANALİZİ BAŞLAT (GARANTİ MOD)'):
+    data = heavy_pro_scanner()
     
     if not data.empty:
-        # Renklendirme Fonksiyonu
-        def style_commands(row):
-            bg = ''
-            if "🚀 LONG" in row['EYLEM / KOMUT']: bg = 'background-color: #0c3e1e; color: #52ff8f; font-weight: bold'
-            elif "💥 SHORT" in row['EYLEM / KOMUT']: bg = 'background-color: #4b0a0a; color: #ff6e6e; font-weight: bold'
-            return [bg]*len(row)
+        def style_pro(row):
+            color = ''
+            if row['GÜVEN SKORU'] >= 80:
+                color = 'background-color: #11381b; color: #52ff8f; font-weight: bold' if "LONG" in row['KOMUT'] else 'background-color: #3b0d0d; color: #ff6e6e; font-weight: bold'
+            return [color]*len(row)
 
-        # Tabloyu göster
-        st.subheader("📊 Güncel İşlem Sinyalleri")
-        st.dataframe(
-            data.sort_values('RENK', ascending=False).drop(columns=['RENK']).style.apply(style_commands, axis=1),
-            use_container_width=True,
-            height=600
-        )
+        st.dataframe(data.style.apply(style_pro, axis=1), use_container_width=True)
     else:
-        st.error("Veri alınamadı, tekrar deneyin.")
+        st.error("Veri çekilemedi.")
