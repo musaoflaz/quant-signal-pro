@@ -2,11 +2,10 @@ import streamlit as st
 import pandas as pd
 import ccxt
 import requests
-import time
 from datetime import datetime
 import pytz
 
-# --- AYARLAR ---
+# --- AYARLAR (Bilgilerini Buraya Gir) ---
 TELEGRAM_TOKEN = "BURAYA_TOKEN_YAZ"
 TELEGRAM_CHAT_ID = "BURAYA_ID_YAZ"
 COINLER = ['BTC/USDT', 'ETH/USDT', 'NEAR/USDT', 'SOL/USDT', 'AVAX/USDT']
@@ -14,7 +13,7 @@ COINLER = ['BTC/USDT', 'ETH/USDT', 'NEAR/USDT', 'SOL/USDT', 'AVAX/USDT']
 st.set_page_config(page_title="Sniper Bot Pro", layout="wide")
 st.title("🎯 Long/Short Skor Sistemi")
 
-# --- BAŞARILI ANALİZ FONKSİYONU ---
+# --- ANALİZ FONKSİYONU ---
 def analiz_yap():
     sonuclar = []
     exchange = ccxt.binance()
@@ -23,34 +22,33 @@ def analiz_yap():
             ohlcv = exchange.fetch_ohlcv(coin, timeframe='1h', limit=50)
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # Senin Başarılı Skorlama Mantığın
             fiyat = df['c'].iloc[-1]
             degisim = ((df['c'].iloc[-1] - df['c'].iloc[-2]) / df['c'].iloc[-2]) * 100
             
+            # Başarılı Skorlama Mantığın
             if degisim > 0:
-                skor = f"{int(70 + degisim*10)} (LONG)"
+                skor = f"{int(70 + degisim*10)} (LONG) ✅"
             else:
-                skor = f"{int(30 + degisim*10)} (SHORT)"
+                skor = f"{int(30 + degisim*10)} (SHORT) ❌"
             
             sonuclar.append({"Coin": coin, "Fiyat": fiyat, "Skor": skor})
         except:
             continue
     return pd.DataFrame(sonuclar)
 
-# --- SENİN ESKİ BUTONLU SİSTEMİN ---
+# --- SİSTEMİ BAŞLAT BUTONU ---
 if st.button("🚀 SİSTEMİ BAŞLAT"):
+    st.write(f"Tarama yapıldı: {datetime.now(pytz.timezone('Europe/Istanbul')).strftime('%H:%M:%S')}")
     df_sonuc = analiz_yap()
+    
+    # 1. EKRANA TABLO BAS
     st.table(df_sonuc)
     
-    # Telegram Gönderimi
-    mesaj = "🚀 GÜNCEL SKORLAR\n\n" + df_sonuc.to_string(index=False)
+    # 2. TELEGRAM'A MESAJ AT
+    mesaj = "🚀 **GÜNCEL SKORLAR** 🚀\n\n"
+    for i, row in df_sonuc.iterrows():
+        mesaj += f"🔹 {row['Coin']}: {row['Fiyat']} | **{row['Skor']}**\n"
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": mesaj})
-    st.success("Telegram'a gönderildi!")
-
-# --- 7/24 PING DESTEĞİ (Sistemi Bozmayan Kısım) ---
-# Sadece bu alt kısım Render'ın uyumasını engeller, yukarıdaki koduna dokunmaz.
-st.sidebar.write("---")
-st.sidebar.info("7/24 Modu Aktif")
-time.sleep(300) # 5 dakika bekle
-st.rerun() # Sayfayı tazele (UptimeRobot için)
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": mesaj, "parse_mode": "Markdown"})
+    st.success("Sinyaller Telegram'a başarıyla gönderildi!")
