@@ -5,51 +5,42 @@ import pandas_ta as ta
 import time
 import requests
 
-# --- AYARLAR ---
+# --- KİMLİK BİLGİLERİ ---
 TOKEN = "8330775219:AAHMGpdCdCEStj-B4Y3_WHD7xPEbjeaHWFM"
 CHAT_ID = "1358384022"
 
 def telegram_yolla(mesaj):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": mesaj}, timeout=10)
-    except:
-        pass
+    try: requests.post(url, json={"chat_id": CHAT_ID, "text": mesaj}, timeout=10)
+    except: pass
 
-# Borsa Bağlantısı
 exchange = ccxt.kucoin({'enableRateLimit': True})
 
-st.set_page_config(page_title="Alpha Sniper Pro V42", layout="wide")
-st.title("🛡️ ALPHA SNIPER PRO (V42)")
-st.info("Log hataları giderildi. Canlı takip tablosu ve ultra keskin sinyal filtresi aktif.")
+st.set_page_config(page_title="Alpha Sniper Ultra-Elite", layout="wide")
+st.title("🛡️ ALPHA SNIPER V42: ULTRA-ELITE SCANNER")
+st.sidebar.success("MOD: Haftalık 3-5 Garantici İşlem")
+st.sidebar.info("Bu modda kriterler çok ağırdır. Tablo genelde 0-30 puan arası kalacaktır.")
 
-# --- COİN LİSTESİNİ OTOMATİK AL ---
 @st.cache_data
-def get_all_symbols():
+def get_symbols():
     try:
-        markets = exchange.load_markets()
-        # Sadece USDT çiftlerini ve aktif olanları al (İlk 50 hacimli gibi filtreleyebiliriz)
-        all_symbols = [symbol for symbol in markets if '/USDT' in symbol and markets[symbol]['active']]
-        return all_symbols[:40] # Performans için en popüler 40 tanesini tarar
+        m = exchange.load_markets()
+        return [s for s in m if '/USDT' in s and m[s]['active']][:60]
     except:
-        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'FET/USDT', 'SUI/USDT', 'NEAR/USDT', 'TIA/USDT', 'PEPE/USDT', 'DOGE/USDT']
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'FET/USDT', 'SUI/USDT', 'NEAR/USDT']
 
-symbols = get_all_symbols()
+symbols = get_symbols()
 
-if 'run' not in st.session_state:
-    st.session_state.run = False
+if 'run' not in st.session_state: st.session_state.run = False
 
-# Analiz Başlat/Durdur Butonları
 c1, c2 = st.columns([1, 4])
 with c1:
-    if st.button("🎯 ANALİZİ BAŞLAT"):
+    if st.button("🎯 ULTRA TARAMAYI BAŞLAT"):
         st.session_state.run = True
-        telegram_yolla("🚀 Pro Tarayıcı Yayında! Tablo güncelleniyor...")
+        telegram_yolla("💎 Ultra-Elite Sniper Pusuya Yattı. Sadece 'Kusursuz' sinyaller bekleniyor.")
 with c2:
-    if st.button("🛑 DURDUR"):
-        st.session_state.run = False
+    if st.button("🛑 SİSTEMİ KAPAT"): st.session_state.run = False
 
-# Tablo Alanı
 placeholder = st.empty()
 
 if st.session_state.run:
@@ -57,57 +48,61 @@ if st.session_state.run:
         data_list = []
         for s in symbols:
             try:
-                bars = exchange.fetch_ohlcv(s, timeframe='1h', limit=100)
+                bars = exchange.fetch_ohlcv(s, timeframe='1h', limit=200)
                 df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
                 
-                # İndikatörler
-                df['EMA200'] = ta.ema(df['c'], length=200) or df['c'].rolling(100).mean()
+                # --- AĞIRLAŞTIRILMIŞ ANALİZ ---
+                df['EMA200'] = ta.ema(df['c'], length=200)
                 df['RSI'] = ta.rsi(df['c'], length=14)
-                stoch = ta.stochrsi(df['c'])
+                stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
                 df = pd.concat([df, stoch], axis=1)
                 
                 l, p = df.iloc[-1], df.iloc[-2]
                 sk = [col for col in df.columns if 'STOCHRSIk' in col][0]
                 sd = [col for col in df.columns if 'STOCHRSId' in col][0]
                 
-                # Skor Hesaplama
                 skor = 0
-                komut = "🔍 TAKİP ET"
-                
-                if l['c'] > l['EMA200']: skor += 40
-                if p[sk] < p[sd] and l[sk] > l[sd]: skor += 40
-                if 30 <= l['RSI'] <= 60: skor += 20
-                
-                if skor >= 90: komut = "🚀 KESİN LONG"
-                elif skor >= 70: komut = "⚡ SİNYAL YAKIN"
-                
-                data_list.append({
-                    "COIN": s,
-                    "SKOR": skor,
-                    "KOMUT": komut,
-                    "RSI": int(l['RSI']),
-                    "FİYAT": l['c']
-                })
-                
-                # 100 Puan Sinyali Telegram'a
-                if skor >= 100:
-                    telegram_yolla(f"🎯 100 PUAN! {s}\nFiyat: {l['c']}\nKomut: {komut}")
-                
-            except:
-                continue
-        
-        # Tabloyu Ekrana Bas
-        final_df = pd.DataFrame(data_list).sort_values(by="SKOR", ascending=False)
-        
-        with placeholder.container():
-            # Renklendirme Fonksiyonu
-            def color_skor(val):
-                color = 'white'
-                if val >= 90: color = '#FFD700' # Altın sarısı
-                elif val >= 70: color = '#90EE90' # Yeşilimsi
-                return f'background-color: {color}; color: black; font-weight: bold'
+                notlar = []
 
-            st.write(f"🔄 Son Tarama: {time.strftime('%H:%M:%S')}")
-            st.table(final_df.style.applymap(color_skor, subset=['SKOR']))
+                # 1. Trend Sert Filtre (30 Puan)
+                if l['c'] > l['EMA200'] and l['EMA200'] > df['EMA200'].iloc[-5]:
+                    skor += 30
+                    notlar.append("Trend+")
+
+                # 2. Dip Kesişimi Sert Filtre (40 Puan) - Mutlaka 25'in altında kesişmeli
+                if p[sk] < p[sd] and l[sk] > l[sd] and l[sk] < 25:
+                    skor += 40
+                    notlar.append("Dip-OK")
+
+                # 3. Hacim Onayı (20 Puan) - Hacim ortalamanın %50 üzerinde olmalı
+                vol_avg = df['v'].tail(15).mean()
+                if l['v'] > (vol_avg * 1.5):
+                    skor += 20
+                    notlar.append("Hacim-OK")
+
+                # 4. RSI Stratejik Bölge (10 Puan)
+                if 45 <= l['RSI'] <= 65:
+                    skor += 10
+                    notlar.append("Güç-OK")
+
+                durum = "🔍 Beklemede"
+                if skor >= 100: durum = "💎 ELMAS SİNYAL"
+                elif skor >= 70: durum = "🔥 RADARDA"
+
+                data_list.append({
+                    "COIN": s, "SKOR": skor, "ANALİZ": durum,
+                    "FİYAT": f"{l['c']:.4f}", "RSI": int(l['RSI']), "ONAYLAR": " | ".join(notlar)
+                })
+
+                if skor >= 100:
+                    telegram_yolla(f"💎 **ELMAS SİNYAL YAKALANDI!**\n\nCoin: {s}\nFiyat: {l['c']}\nSkor: 100/100\nOnaylar: {', '.join(notlar)}\n\n⚠️ Bu sinyal nadir gelir, grafiği kontrol et!")
+                
+            except: continue
         
-        time.sleep(60) # Her dakika tabloyu tazeler
+        final_df = pd.DataFrame(data_list).sort_values(by="SKOR", ascending=False)
+        with placeholder.container():
+            st.write(f"⏱️ Son Tarama: {time.strftime('%H:%M:%S')}")
+            # Tabloyu görselleştir
+            st.dataframe(final_df, use_container_width=True)
+        
+        time.sleep(60)
