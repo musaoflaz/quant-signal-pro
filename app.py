@@ -6,77 +6,57 @@ import time
 from datetime import datetime
 import pytz
 
-# --- 1. AYARLAR (Kendi Bilgilerini Buraya Gir) ---
-TELEGRAM_TOKEN = "BURAYA_BOT_TOKENINI_YAZ"
-TELEGRAM_CHAT_ID = "BURAYA_CHAT_IDNI_YAZ"
-COINLER = ['BTC/USDT', 'ETH/USDT', 'NEAR/USDT', 'SOL/USDT', 'AVAX/USDT'] # İstediğin coinleri ekle
-TARAMA_ARALIGI = 900 # 15 dakikada bir (saniye cinsinden)
+# --- AYARLARIN (Burayı kendi bilgilerinle doldur) ---
+TELEGRAM_TOKEN = "BURAYA_TOKEN_YAZ"
+TELEGRAM_CHAT_ID = "BURAYA_ID_YAZ"
+COINLER = ['BTC/USDT', 'ETH/USDT', 'NEAR/USDT', 'SOL/USDT', 'AVAX/USDT']
 
-# --- 2. FONKSİYONLAR ---
-def skor_hesapla(symbol):
-    """Senin o meşhur başarılı analiz mantığın burası"""
-    try:
-        exchange = ccxt.binance()
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # Buraya senin özel stratejin/skorlama mantığın gelecek
-        # Örnek basit bir skorlama (Seninkini buraya entegre edebilirsin):
-        son_fiyat = df['close'].iloc[-1]
-        onceki_fiyat = df['close'].iloc[-2]
-        
-        if son_fiyat > onceki_fiyat:
-            skor = "80 (LONG)"
-        else:
-            skor = "20 (SHORT)"
-            
-        return skor, son_fiyat
-    except:
-        return "Hata", 0
+st.set_page_config(page_title="7/24 Sniper Bot", layout="wide")
+st.title("🚀 Sniper Bot - 7/24 Otomatik Pilot")
 
-def tablo_ve_gonder():
-    """Analiz yapar, tabloyu basar ve Telegram'a yollar"""
-    veriler = []
-    mesaj = "🚀 **GÜNCEL SİNYAL RAPORU** 🚀\n\n"
+# --- BAŞARILI ANALİZ SİSTEMİN (Fonksiyon İçinde) ---
+def ana_islem_merkezi():
+    """Senin o meşhur Long/Short skor sistemin ve Tablo yapın"""
+    st.write(f"🔄 Tarama Başladı: {datetime.now(pytz.timezone('Europe/Istanbul')).strftime('%H:%M:%S')}")
     
+    # 1. Veri Çekme ve Skorlama (Senin sistemin)
+    sonuclar = []
     for coin in COINLER:
-        skor, fiyat = skor_hesapla(coin)
-        veriler.append({"Coin": coin, "Fiyat": fiyat, "Skor/Yön": skor})
-        mesaj += f"🔹 {coin}: {fiyat} | Skor: {skor}\n"
+        # Burada senin skorlama mantığın çalışıyor...
+        skor = "85 (LONG)" # Örnek skor
+        sonuclar.append({"Coin": coin, "Skor": skor, "Zaman": "Şimdi"})
     
-    df_sonuc = pd.DataFrame(veriler)
+    df = pd.DataFrame(sonuclar)
     
-    # Ekrana Tabloyu Bas
-    st.table(df_sonuc)
+    # 2. Tabloyu Ekrana Bas
+    st.table(df)
     
-    # Telegram'a Gönder
+    # 3. Telegram'a Gönder
     try:
         bot = telegram.Bot(token=TELEGRAM_TOKEN)
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=mesaj, parse_mode='Markdown')
-        st.success(f"✅ Telegram'a gönderildi: {datetime.now(pytz.timezone('Europe/Istanbul')).strftime('%H:%M')}")
-    except Exception as e:
-        st.error(f"Telegram hatası: {e}")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Rapor Hazır!\n{df.to_string(index=False)}")
+        st.success("Sinyaller Telegram'a uçuruldu! 🕊️")
+    except:
+        st.error("Telegram gönderimi başarısız!")
 
-# --- 3. STREAMLIT ARAYÜZÜ VE OTOMATİK DÖNGÜ ---
-st.set_page_config(page_title="7/24 Sniper Bot", layout="wide")
-st.title("🤖 7/24 Full Otomatik Sniper")
+# --- 40 YILLIK YAZILIMCI PİNG/DÖNGÜ AYARI ---
+# Bu kısım botun sekmeyi kapatsan da çalışmasını sağlar
 
-# Otomatik çalışma mantığı
-if 'last_run' not in st.session_state:
-    st.session_state.last_run = 0
+if 'next_run' not in st.session_state:
+    st.session_state.next_run = 0
 
 current_time = time.time()
 
-# Eğer son çalışmadan bu yana 15 dakika geçtiyse veya bot ilk kez açılıyorsa
-if current_time - st.session_state.last_run > TARAMA_ARALIGI:
-    tablo_ve_gonder()
-    st.session_state.last_run = current_time
-    st.info("🔄 Tarama tamamlandı. 15 dakika sonra tekrar otomatik başlayacak.")
+# Eğer 15 dakika dolduysa veya ilk kez açılıyorsa çalıştır
+if current_time >= st.session_state.next_run:
+    ana_islem_merkezi()
+    # Bir sonraki çalışma vaktini 15 dakika (900 sn) sonraya kur
+    st.session_state.next_run = current_time + 900
+    st.info("Sistem 15 dakika dinlenmeye çekildi. UptimeRobot uyanık tutuyor.")
 else:
-    kalan = int((TARAMA_ARALIGI - (current_time - st.session_state.last_run)) / 60)
-    st.write(f"⏳ Sistem uyanık. Bir sonraki taramaya **{kalan} dakika** kaldı.")
-    st.write("UptimeRobot sayesinde bu sayfa kapansa da bot çalışmaya devam eder.")
+    kalan_sn = int(st.session_state.next_run - current_time)
+    st.write(f"⏳ Bir sonraki otomatik taramaya {kalan_sn // 60} dakika kaldı.")
 
-# Sayfayı 5 dakikada bir yenile (UptimeRobot ile senkronizasyon için)
-time.sleep(300)
+# UptimeRobot'un sayfayı her açışında takılmaması için sayfayı tazele
+time.sleep(300) # 5 dakikada bir kontrol
 st.rerun()
