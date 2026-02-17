@@ -4,7 +4,7 @@ import ccxt
 import pandas_ta as ta
 import time
 
-st.set_page_config(layout="wide", page_title="Alpha Sniper | Pro-Confirmation")
+st.set_page_config(layout="wide", page_title="Alpha Sniper | Gold Standard")
 
 # Binance Futures Bağlantısı
 exchange = ccxt.binance({
@@ -13,41 +13,39 @@ exchange = ccxt.binance({
     'timeout': 60000
 })
 
-st.markdown("# 🏛️ QUANT ALPHA: AĞIR ANALİZ (MULTI-CONFIRM)")
-st.info("Sistem her coini H4 ve H1 zaman dilimlerinde çapraz kontrole alıyor. Bu işlem biraz zaman alır ama daha güvenlidir.")
+st.markdown("# 🏛️ QUANT ALPHA: GOLD STANDARD")
+st.write("---")
 
 def get_pro_symbols():
     try:
-        # Sadece hacmi en yüksek ilk 25 coini al (Kalite > Nicelik)
         tickers = exchange.fetch_tickers()
         df_t = pd.DataFrame.from_dict(tickers, orient='index')
         df_t = df_t[df_t['symbol'].str.contains('USDT')]
-        return df_t.sort_values('quoteVolume', ascending=False).head(25).index.tolist()
+        # Hacmi en yüksek 30 coin (Okyanusun en büyük balıkları)
+        return df_t.sort_values('quoteVolume', ascending=False).head(30).index.tolist()
     except:
         return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
 
-def heavy_pro_scanner():
+def heavy_gold_scanner():
     symbols = get_pro_symbols()
     results = []
     progress = st.progress(0)
     status = st.empty()
     
     for idx, symbol in enumerate(symbols):
-        status.info(f"🛡️ Derin Analiz Yapılıyor: **{symbol}**")
+        status.info(f"🛡️ Analiz Ediliyor: **{symbol}**")
         try:
-            # 1. KATMAN: H4 (4 Saatlik) ANA TREND KONTROLÜ
+            # H4 Ana Trend
             bars_h4 = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=200)
             df_h4 = pd.DataFrame(bars_h4, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             ema200_h4 = ta.ema(df_h4['c'], length=200).iloc[-1]
             last_c = df_h4['c'].iloc[-1]
-            
-            ana_trend = "UP" if last_c > ema200_h4 else "DOWN"
+            ana_trend = "BOĞA (H4)" if last_c > ema200_h4 else "AYI (H4)"
 
-            # 2. KATMAN: H1 (1 Saatlik) SİNYAL KONTROLÜ
+            # H1 Sinyal
             bars_h1 = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
             df_h1 = pd.DataFrame(bars_h1, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # Göstergeler (H1)
             stoch = ta.stochrsi(df_h1['c'], length=14, rsi_length=14, k=3, d=3)
             df_h1 = pd.concat([df_h1, stoch], axis=1)
             rsi = ta.rsi(df_h1['c'], length=14).iloc[-1]
@@ -56,62 +54,59 @@ def heavy_pro_scanner():
             l_h1, p_h1 = df_h1.iloc[-1], df_h1.iloc[-2]
             sk, sd = "STOCHRSIk_14_14_3_3", "STOCHRSId_14_14_3_3"
             
-            # --- GARANTİ SKOR HESAPLAMA ---
-            final_skor = 0
-            komut = "BEKLE"
+            # --- PROFESYONEL PUANLAMA ---
+            puan = 0
             
-            # LONG İÇİN ÇOKLU ONAY
-            if ana_trend == "UP":
-                final_skor += 40 # Ana trend yönünde puan
-                if p_h1[sk] < p_h1[sd] and l_h1[sk] > l_h1[sd]: # Kesişim
-                    final_skor += 40
-                if l_h1['v'] > vol_avg: # Hacim Onayı
-                    final_skor += 10
-                if rsi < 65: # Aşırı alım değilse
-                    final_skor += 10
-                
-                if final_skor >= 80: komut = "🚀 GÜÇLÜ LONG"
-                elif final_skor >= 50: komut = "📈 LONG TAKİP"
+            # Trend Puanı (40 Puan)
+            if (ana_trend == "BOĞA (H4)" and l_h1['c'] > ema200_h4): puan += 40
+            elif (ana_trend == "AYI (H4)" and l_h1['c'] < ema200_h4): puan += 40
+            
+            # Kesişim Puanı (40 Puan)
+            long_cross = p_h1[sk] < p_h1[sd] and l_h1[sk] > l_h1[sd]
+            short_cross = p_h1[sk] > p_h1[sd] and l_h1[sk] < l_h1[sd]
+            
+            if ana_trend == "BOĞA (H4)" and long_cross: puan += 40
+            if ana_trend == "AYI (H4)" and short_cross: puan += 40
+            
+            # Hacim ve RSI Bonusu (20 Puan)
+            if l_h1['v'] > vol_avg: puan += 10
+            if (ana_trend == "BOĞA (H4)" and rsi < 65) or (ana_trend == "AYI (H4)" and rsi > 35): puan += 10
 
-            # SHORT İÇİN ÇOKLU ONAY
-            elif ana_trend == "DOWN":
-                final_skor += 40
-                if p_h1[sk] > p_h1[sd] and l_h1[sk] < l_h1[sd]:
-                    final_skor += 40
-                if l_h1['v'] > vol_avg:
-                    final_skor += 10
-                if rsi > 35:
-                    final_skor += 10
-                
-                if final_skor >= 80: komut = "💥 GÜÇLÜ SHORT"
-                elif final_skor >= 50: komut = "📉 SHORT TAKİP"
+            # Komut Belirleme
+            komut = "İZLE"
+            if puan >= 80: komut = "🚀 LONG" if ana_trend == "BOĞA (H4)" else "💥 SHORT"
+            elif puan >= 50: komut = "📈 GÖZLEM" if ana_trend == "BOĞA (H4)" else "📉 GÖZLEM"
 
             results.append({
                 "COIN": symbol,
                 "FİYAT": f"{l_h1['c']:.4f}",
                 "KOMUT": komut,
-                "GÜVEN SKORU": final_skor,
-                "TREND (H4)": ana_trend,
-                "HACİM": "YÜKSEK" if l_h1['v'] > vol_avg else "NORMAL"
+                "SKOR": puan,
+                "TREND": ana_trend,
+                "RSI": int(rsi)
             })
-            time.sleep(0.5) # Ağır döngü, borsa koruması
+            time.sleep(0.4)
         except: continue
         progress.progress((idx + 1) / len(symbols))
     
     status.empty()
-    return pd.DataFrame(results).sort_values('GÜVEN SKORU', ascending=False)
+    return pd.DataFrame(results).sort_values('SKOR', ascending=False)
 
 # --- Arayüz ---
-if st.button('🛡️ DERİN ANALİZİ BAŞLAT (GARANTİ MOD)'):
-    data = heavy_pro_scanner()
+if st.button('🛡️ GOLD ANALİZİ BAŞLAT'):
+    data = heavy_gold_scanner()
     
     if not data.empty:
-        def style_pro(row):
+        def style_gold(row):
             color = ''
-            if row['GÜVEN SKORU'] >= 80:
+            if row['SKOR'] >= 80:
                 color = 'background-color: #11381b; color: #52ff8f; font-weight: bold' if "LONG" in row['KOMUT'] else 'background-color: #3b0d0d; color: #ff6e6e; font-weight: bold'
             return [color]*len(row)
 
-        st.dataframe(data.style.apply(style_pro, axis=1), use_container_width=True)
+        st.dataframe(
+            data.style.apply(style_gold, axis=1), 
+            use_container_width=True, 
+            height=650
+        )
     else:
         st.error("Veri çekilemedi.")
