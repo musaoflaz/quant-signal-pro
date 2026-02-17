@@ -4,43 +4,43 @@ import ccxt
 import pandas_ta as ta
 import time
 
-st.set_page_config(layout="wide", page_title="Alpha Sniper | Bybit Pro")
+st.set_page_config(layout="wide", page_title="Quant Alpha | V20 Global")
 
-# 1. Bybit Bağlantısı (Bulut sunucularında daha stabil çalışır)
+# BYBIT Bağlantısı (Bulut sunucuları için en garantisi)
 exchange = ccxt.bybit({
     'enableRateLimit': True, 
-    'options': {'defaultType': 'linear'}, # Vadeli (Futures) işlemler için
+    'options': {'defaultType': 'linear'}, 
     'timeout': 60000
 })
 
-st.markdown("# 🏛️ QUANT ALPHA: BYBIT PRO FUTURES")
+st.markdown("# 🏛️ QUANT ALPHA: GLOBAL SNIPER")
 st.write("---")
 
-def get_bybit_symbols():
+def get_pro_symbols():
     try:
         markets = exchange.fetch_markets()
-        # Sadece USDT vadeli çiftlerini al
+        # Sadece popüler ve hacimli USDT çiftleri
         symbols = [m['symbol'] for m in markets if m['active'] and m['quote'] == 'USDT' and m['linear']]
-        return symbols[:30] # İlk 30 aktif çift
-    except Exception as e:
-        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'AVAX/USDT']
+        return symbols[:30]
+    except:
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
 
-def bybit_scanner():
-    symbols = get_bybit_symbols()
+def global_scanner():
+    symbols = get_pro_symbols()
     results = []
     progress = st.progress(0)
     status = st.empty()
     
     for idx, symbol in enumerate(symbols):
-        status.info(f"🛡️ Analiz Ediliyor: **{symbol}**")
+        status.info(f"🔍 Analiz: **{symbol}**")
         try:
-            # 1 Saatlik Veri
+            # Tek seferde 1 saatlik veri çekimi (Hız için)
             bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=250)
             if len(bars) < 200: continue
             
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # Strateji Hesaplama
+            # İndikatörler
             df['EMA200'] = ta.ema(df['c'], length=200)
             stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
             df = pd.concat([df, stoch], axis=1)
@@ -49,32 +49,37 @@ def bybit_scanner():
             l, p = df.iloc[-1], df.iloc[-2]
             sk, sd = "STOCHRSIk_14_14_3_3", "STOCHRSId_14_14_3_3"
             
-            puan = 0
-            trend = "LONG" if l['c'] > l['EMA200'] else "SHORT"
+            # --- GELİŞMİŞ SKORLAMA ---
+            skor = 0
             
-            # Onay Puanları
-            puan += 40 # Ana Trend puanı
+            # 1. Trend Onayı (40 Puan)
+            trend_yukari = l['c'] > l['EMA200']
+            skor += 40 
             
-            # Kesişim Kontrolü
-            if trend == "LONG" and p[sk] < p[sd] and l[sk] > l[sd]:
-                puan += 40
-            elif trend == "SHORT" and p[sk] > p[sd] and l[sk] < l[sd]:
-                puan += 40
-                
-            # Momentum
-            if (trend == "LONG" and l['RSI'] < 65) or (trend == "SHORT" and l['RSI'] > 35):
-                puan += 20
+            # 2. Kesişim Onayı (40 Puan)
+            up_cross = p[sk] < p[sd] and l[sk] > l[sd]
+            down_cross = p[sk] > p[sd] and l[sk] < l[sd]
+            
+            if trend_yukari and up_cross: skor += 40
+            elif not trend_yukari and down_cross: skor += 40
+            
+            # 3. RSI Güvenlik Filtresi (20 Puan)
+            if (trend_yukari and l['RSI'] < 70) or (not trend_yukari and l['RSI'] > 30):
+                skor += 20
 
-            komut = "İZLE"
-            if puan >= 80:
-                komut = "🚀 LONG GİRİŞ" if trend == "LONG" else "💥 SHORT GİRİŞ"
+            # Komut Belirleme
+            komut = "⌛ BEKLE"
+            if skor >= 80:
+                komut = "🚀 LONG GİR" if trend_yukari else "💥 SHORT GİR"
+            elif skor >= 40:
+                komut = "📈 LONG TAKİP" if trend_yukari else "📉 SHORT TAKİP"
 
             results.append({
                 "COIN": symbol,
                 "FİYAT": f"{l['c']:.4f}",
-                "KOMUT": komut,
-                "SKOR": puan,
-                "TREND": trend,
+                "EYLEM": komut,
+                "SKOR": skor,
+                "TREND": "YUKARI" if trend_yukari else "AŞAĞI",
                 "RSI": int(l['RSI'])
             })
             time.sleep(0.2)
@@ -82,20 +87,27 @@ def bybit_scanner():
         progress.progress((idx + 1) / len(symbols))
     
     status.empty()
-    if not results: return pd.DataFrame()
+    progress.empty()
+    
+    # Boş liste hatasını kökten çözen kontrol
+    if not results:
+        return pd.DataFrame(columns=["COIN", "FİYAT", "EYLEM", "SKOR", "TREND", "RSI"])
+        
     return pd.DataFrame(results).sort_values('SKOR', ascending=False)
 
 # --- Arayüz ---
-if st.button('🚀 ANALİZİ BAŞLAT (BYBIT)'):
-    data = bybit_scanner()
+if st.button('🎯 GLOBAL TARAMAYI BAŞLAT'):
+    data = global_scanner()
     
     if not data.empty:
-        def style_pro(row):
-            color = ''
+        # Renklendirme
+        def style_v20(row):
+            bg = ''
             if row['SKOR'] >= 80:
-                color = 'background-color: #0c3e1e; color: #52ff8f' if "LONG" in row['KOMUT'] else 'background-color: #4b0a0a; color: #ff6e6e'
-            return [color]*len(row)
+                bg = 'background-color: #0c3e1e; color: #52ff8f' if "LONG" in row['EYLEM'] else 'background-color: #4b0a0a; color: #ff6e6e'
+            return [bg]*len(row)
 
-        st.dataframe(data.style.apply(style_pro, axis=1), use_container_width=True, height=600)
+        st.subheader("📊 Canlı Sinyal Masası")
+        st.dataframe(data.style.apply(style_v20, axis=1), use_container_width=True, height=600)
     else:
-        st.warning("⚠️ Şu an kriterlere uyan sinyal yok veya borsa meşgul. Lütfen tekrar deneyin.")
+        st.warning("⚠️ Şu an kriterlere uyan bir coin bulunamadı. Lütfen birkaç dakika sonra tekrar deneyin.")
