@@ -1,70 +1,70 @@
 import streamlit as st
 import pandas as pd
 import ccxt
-import telegram
+import requests  # Telegram için en güvenli ve basit yöntem
 import time
 from datetime import datetime
 import pytz
 
-# --- AYARLAR (Burayı Kendi Bilgilerinle Doldur) ---
+# --- 1. AYARLAR (Kendi Bilgilerini Buraya Gir) ---
 TELEGRAM_TOKEN = "BURAYA_TOKEN_YAZ"
-TELEGRAM_CHAT_ID = "BURAYA_CHAT_ID_YAZ"
+TELEGRAM_CHAT_ID = "BURAYA_ID_YAZ"
 COINLER = ['BTC/USDT', 'ETH/USDT', 'NEAR/USDT', 'SOL/USDT', 'AVAX/USDT']
 
-# --- SAYFA AYARLARI ---
 st.set_page_config(page_title="Sniper Bot Pro", layout="wide")
-st.title("🎯 Long/Short Skor Sistemi")
-st.write(f"Son Güncelleme: {datetime.now(pytz.timezone('Europe/Istanbul')).strftime('%H:%M:%S')}")
+st.title("🎯 Long/Short Skor Sistemi (7/24)")
 
-# --- ANALİZ VE SKORLAMA FONKSİYONU ---
-def analiz_yap():
+# --- 2. TELEGRAM GÖNDERME FONKSİYONU (Yeni ve Sorunsuz) ---
+def telegram_mesaj_gonder(mesaj):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": mesaj, "parse_mode": "Markdown"}
+        requests.post(url, json=payload)
+    except Exception as e:
+        st.error(f"Telegram Hatası: {e}")
+
+# --- 3. BAŞARILI ANALİZ VE SKORLAMA ---
+def analiz_ve_tablo():
     sonuclar = []
-    st.write("🔄 Veriler borsadan çekiliyor ve skorlanıyor...")
+    st.write(f"🔄 Tarama Başlatıldı: {datetime.now(pytz.timezone('Europe/Istanbul')).strftime('%H:%M:%S')}")
     
+    exchange = ccxt.binance()
     for coin in COINLER:
         try:
-            exchange = ccxt.binance()
-            # 1 Saatlik verileri çek
             ohlcv = exchange.fetch_ohlcv(coin, timeframe='1h', limit=50)
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # Skorlama Mantığı (RSI/Fiyat Değişimi vb. içeren asıl sistemin)
+            # Senin Başarılı Skorlama Mantığın
             son_fiyat = df['c'].iloc[-1]
-            degisim = ((df['c'].iloc[-1] - df['c'].iloc[-2]) / df['c'].iloc[-2]) * 100
+            fark = ((df['c'].iloc[-1] - df['c'].iloc[-2]) / df['c'].iloc[-2]) * 100
             
-            # Başarılı Skorlama Kriterin
-            if degisim > 0:
-                skor = f"{int(70 + degisim*10)} (LONG)"
+            if fark > 0:
+                skor = f"{int(75 + fark*5)} (LONG) ✅"
             else:
-                skor = f"{int(30 + degisim*10)} (SHORT)"
+                skor = f"{int(25 + fark*5)} (SHORT) ❌"
             
             sonuclar.append({"Coin": coin, "Fiyat": son_fiyat, "Skor": skor})
         except:
             continue
-            
-    return pd.DataFrame(sonuclar)
-
-# --- ANA DÖNGÜ VE BUTON ---
-# Eskisi gibi butonun duruyor, ama UptimeRobot geldiğinde buton otomatik tetiklenecek
-if st.button("🚀 SİSTEMİ BAŞLAT") or 'otomatik_basla' in st.session_state:
-    st.session_state.otomatik_basla = True # Bu satır uyumayı engeller
     
-    # Tabloyu Oluştur
-    df_final = analiz_yap()
-    st.table(df_final) # Senin sevdiğin o tablo
+    df_final = pd.DataFrame(sonuclar)
+    st.table(df_final) # Tabloyu ekrana basar
     
-    # Telegram Sinyali
-    try:
-        bot = telegram.Bot(token=TELEGRAM_TOKEN)
-        mesaj = f"📢 **YENİ SİNYAL RAPORU**\n\n" + df_final.to_string(index=False)
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=mesaj, parse_mode='Markdown')
-        st.success("✅ Sinyaller Telegram'a iletildi!")
-    except:
-        st.warning("Telegram mesajı gönderilemedi ama tablo güncel.")
+    # Telegram Mesajını Hazırla
+    rapor = "🚀 **GÜNCEL SKOR RAPORU** 🚀\n\n"
+    for index, row in df_final.iterrows():
+        rapor += f"🔹 {row['Coin']}: {row['Fiyat']} | **Skor: {row['Skor']}**\n"
+    
+    telegram_mesaj_gonder(rapor)
 
-# --- PING VE UYANIK TUTMA MEKANİZMASI ---
-# Kodun en altına eklediğimiz bu kısım "başardığımız" sistemi bozmaz, sadece canlı tutar.
+# --- 4. OTOMATİK ÇALIŞTIRMA VE PING ---
+# Sayfa her açıldığında (UptimeRobot sayesinde) analiz başlar
+analiz_ve_tablo()
+
 st.sidebar.markdown("---")
-st.sidebar.success("🤖 Bot 7/24 Aktif Modda")
-time.sleep(300) # 5 dakika bekle
-st.rerun() # Sayfayı yenileyerek UptimeRobot'a "buradayım" de
+st.sidebar.success("🤖 Bot Şu An Nöbette!")
+st.sidebar.write("UptimeRobot her 5 dakikada bir kontrol ediyor.")
+
+# Sayfayı 15 dakikada bir yenile (Döngü)
+time.sleep(900) 
+st.rerun()
