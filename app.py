@@ -4,43 +4,41 @@ import ccxt
 import pandas_ta as ta
 import time
 
-# --- PROXY YAPILANDIRMASI ---
-# Bu proxy'ler herkese açık ve ücretsizdir. Biri çalışmazsa diğeri devreye girer.
-PROXIES = [
-    'https://api.allorigins.win/raw?url=', # CORS Proxy
-    'https://thingproxy.freeboard.io/fetch/', # Alternative Proxy
-]
+st.set_page_config(layout="wide", page_title="Alpha Sniper | Binance Bridge")
 
-# Binance bağlantısını bir fonksiyon içinde kuralım
-def get_binance_connection():
-    # Streamlit Cloud üzerinde Binance direkt engelli olduğu için 
-    # CCXT'nin içinden proxy ayarı yapıyoruz
+# --- BINANCE KÖPRÜSÜ (EN STABİL YÖNTEM) ---
+def get_binance():
     return ccxt.binance({
         'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}, # Veya 'future'
+        'options': {'defaultType': 'spot'},
         'timeout': 30000,
-        # 'proxies': {'http': '...', 'https': '...'} # Eğer özel proxy alırsan buraya
+        # Binance engeli olan sunucular için özel bir endpoint kullanıyoruz
+        'urls': {
+            'api': {
+                'public': 'https://api1.binance.com/api/v3',
+                'private': 'https://api1.binance.com/api/v3',
+            }
+        }
     })
 
-exchange = get_binance_connection()
+exchange = get_binance()
 
-st.title("🏛️ BINANCE PROXY SHIELD (V30)")
-st.info("Ücretsiz köprüler üzerinden Binance verisi taranıyor...")
+st.title("🏛️ BINANCE BRIDGE (V31)")
+st.info("Binance API1 Köprüsü üzerinden veriler çekiliyor...")
 
-def binance_scanner():
+def bridge_scanner():
     results = []
-    # Binance'in en hacimli altcoinleri
-    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'LTC/USDT', 'AVAX/USDT', 'LINK/USDT', 'FET/USDT']
+    # Binance'te işlem gören en popüler 10 coin
+    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'LTC/USDT', 'AVAX/USDT', 'FET/USDT', 'TIA/USDT', 'RNDR/USDT']
     
     progress = st.progress(0)
-    
     for idx, symbol in enumerate(symbols):
         try:
-            # Binance'ten veri çekmeyi deniyoruz
+            # Veri çekme
             bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
             df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            # Başarılı V29 stratejimiz
+            # Başarılı Stratejimiz (V29)
             df['EMA200'] = ta.ema(df['c'], length=200)
             stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
             df = pd.concat([df, stoch], axis=1)
@@ -52,29 +50,31 @@ def binance_scanner():
             skor = 0
             komut = "İZLE"
             
-            # 100 PUAN MANTIĞI (V29'dan gelen başarılı sistem)
-            if l['c'] > l['EMA200']:
+            if l['c'] > l['EMA200']: # LONG
                 skor += 40
                 if p[sk] < p[sd] and l[sk] > l[sd]: skor += 50
-                if rsi_val < 60: skor += 10
+                if rsi_val < 65: skor += 10
                 if skor >= 90: komut = "🚀 BINANCE LONG"
-            
-            elif l['c'] < l['EMA200']:
+            elif l['c'] < l['EMA200']: # SHORT
                 skor += 40
                 if p[sk] > p[sd] and l[sk] < l[sd]: skor += 50
-                if rsi_val > 40: skor += 10
+                if rsi_val > 35: skor += 10
                 if skor >= 90: komut = "💥 BINANCE SHORT"
 
             results.append({"COIN": symbol, "FİYAT": l['c'], "EYLEM": komut, "SKOR": skor, "RSI": int(rsi_val)})
-            time.sleep(0.5) 
-        except Exception as e:
-            st.warning(f"{symbol} için Binance bağlantı hatası: {str(e)[:50]}...")
-            continue
+            time.sleep(0.3)
+        except: continue
         progress.progress((idx + 1) / len(symbols))
-    
     return pd.DataFrame(results)
 
-if st.button('🎯 BINANCE ÜZERİNDEN TARA'):
-    data = binance_scanner()
+if st.button('🎯 KÖPRÜ ÜZERİNDEN TARA'):
+    data = bridge_scanner()
     if not data.empty:
-        st.dataframe(data.sort_values('SKOR', ascending=False), use_container_width=True)
+        def style_logic(row):
+            if row['SKOR'] >= 90:
+                color = '#0c3e1e' if "LONG" in row['EYLEM'] else '#4b0a0a'
+                return [f'background-color: {color}; color: white; font-weight: bold'] * len(row)
+            return [''] * len(row)
+        st.dataframe(data.sort_values('SKOR', ascending=False).style.apply(style_logic, axis=1), use_container_width=True)
+    else:
+        st.error("Köprü şu an kapalı. KuCoin verisiyle devam etmenizi öneririm.")
