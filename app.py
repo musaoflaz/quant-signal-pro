@@ -4,109 +4,112 @@ import ccxt
 import pandas_ta as ta
 import time
 
-st.set_page_config(layout="wide", page_title="Alpha Sniper | Gold Standard")
+st.set_page_config(layout="wide", page_title="Alpha Sniper | Binance Futures")
 
-# Binance Futures Bağlantısı
+# 1. Binance Futures Bağlantısı (Özel Yapılandırma)
 exchange = ccxt.binance({
     'enableRateLimit': True, 
-    'options': {'defaultType': 'future'},
+    'options': {'defaultType': 'future'}, # Vadeli işlemler için zorunlu
     'timeout': 60000
 })
 
-st.markdown("# 🏛️ QUANT ALPHA: GOLD STANDARD")
+st.markdown("# 🏛️ QUANT ALPHA: BINANCE FUTURES")
 st.write("---")
 
-def get_pro_symbols():
+def get_binance_symbols():
     try:
-        tickers = exchange.fetch_tickers()
-        df_t = pd.DataFrame.from_dict(tickers, orient='index')
-        df_t = df_t[df_t['symbol'].str.contains('USDT')]
-        # Hacmi en yüksek 30 coin (Okyanusun en büyük balıkları)
-        return df_t.sort_values('quoteVolume', ascending=False).head(30).index.tolist()
-    except:
-        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
+        markets = exchange.fetch_markets()
+        # Sadece USDT vadeli çiftleri ve aktif olanları al
+        symbols = [m['symbol'] for m in markets if m['active'] and m['quote'] == 'USDT' and m['contract']]
+        # En popüler ilk 30 çifti seç (Hız ve stabilite için)
+        return symbols[:30]
+    except Exception as e:
+        st.error(f"Sembol listesi alınamadı: {e}")
+        return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'AVAX/USDT']
 
-def heavy_gold_scanner():
-    symbols = get_pro_symbols()
+def binance_pro_scanner():
+    symbols = get_binance_symbols()
     results = []
     progress = st.progress(0)
     status = st.empty()
     
     for idx, symbol in enumerate(symbols):
-        status.info(f"🛡️ Analiz Ediliyor: **{symbol}**")
+        status.info(f"🛡️ Binance Analiz: **{symbol}**")
         try:
-            # H4 Ana Trend
-            bars_h4 = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=200)
-            df_h4 = pd.DataFrame(bars_h4, columns=['t', 'o', 'h', 'l', 'c', 'v'])
-            ema200_h4 = ta.ema(df_h4['c'], length=200).iloc[-1]
-            last_c = df_h4['c'].iloc[-1]
-            ana_trend = "BOĞA (H4)" if last_c > ema200_h4 else "AYI (H4)"
-
-            # H1 Sinyal
-            bars_h1 = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
-            df_h1 = pd.DataFrame(bars_h1, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            # 1 Saatlik (H1) verileri çekiyoruz
+            bars = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=250)
+            if len(bars) < 200: continue
             
-            stoch = ta.stochrsi(df_h1['c'], length=14, rsi_length=14, k=3, d=3)
-            df_h1 = pd.concat([df_h1, stoch], axis=1)
-            rsi = ta.rsi(df_h1['c'], length=14).iloc[-1]
-            vol_avg = df_h1['v'].rolling(20).mean().iloc[-1]
+            df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             
-            l_h1, p_h1 = df_h1.iloc[-1], df_h1.iloc[-2]
+            # İndikatör Hesaplamaları
+            df['EMA200'] = ta.ema(df['c'], length=200)
+            stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
+            df = pd.concat([df, stoch], axis=1)
+            df['RSI'] = ta.rsi(df['c'], length=14)
+            
+            l = df.iloc[-1]  # Son mum
+            p = df.iloc[-2]  # Bir önceki mum
             sk, sd = "STOCHRSIk_14_14_3_3", "STOCHRSId_14_14_3_3"
             
-            # --- PROFESYONEL PUANLAMA ---
             puan = 0
+            trend = "YUKARI" if l['c'] > l['EMA200'] else "AŞAĞI"
             
-            # Trend Puanı (40 Puan)
-            if (ana_trend == "BOĞA (H4)" and l_h1['c'] > ema200_h4): puan += 40
-            elif (ana_trend == "AYI (H4)" and l_h1['c'] < ema200_h4): puan += 40
+            # PUANLAMA MANTIĞI (Senin Stratejin)
+            # 1. Trend Uyumu (40 Puan)
+            puan += 40 
             
-            # Kesişim Puanı (40 Puan)
-            long_cross = p_h1[sk] < p_h1[sd] and l_h1[sk] > l_h1[sd]
-            short_cross = p_h1[sk] > p_h1[sd] and l_h1[sk] < l_h1[sd]
-            
-            if ana_trend == "BOĞA (H4)" and long_cross: puan += 40
-            if ana_trend == "AYI (H4)" and short_cross: puan += 40
-            
-            # Hacim ve RSI Bonusu (20 Puan)
-            if l_h1['v'] > vol_avg: puan += 10
-            if (ana_trend == "BOĞA (H4)" and rsi < 65) or (ana_trend == "AYI (H4)" and rsi > 35): puan += 10
+            # 2. Kesişim Kontrolü (40 Puan)
+            if trend == "YUKARI" and p[sk] < p[sd] and l[sk] > l[sd]:
+                puan += 40
+            elif trend == "AŞAĞI" and p[sk] > p[sd] and l[sk] < l[sd]:
+                puan += 40
+                
+            # 3. Momentum Bonusu (20 Puan)
+            if (trend == "YUKARI" and l['RSI'] < 65) or (trend == "AŞAĞI" and l['RSI'] > 35):
+                puan += 20
 
-            # Komut Belirleme
+            # Komut Oluşturma
             komut = "İZLE"
-            if puan >= 80: komut = "🚀 LONG" if ana_trend == "BOĞA (H4)" else "💥 SHORT"
-            elif puan >= 50: komut = "📈 GÖZLEM" if ana_trend == "BOĞA (H4)" else "📉 GÖZLEM"
+            if puan >= 80:
+                komut = "🚀 LONG GİRİŞ" if trend == "YUKARI" else "💥 SHORT GİRİŞ"
+            elif puan >= 50:
+                komut = "📈 LONG PUSU" if trend == "YUKARI" else "📉 SHORT PUSU"
 
             results.append({
                 "COIN": symbol,
-                "FİYAT": f"{l_h1['c']:.4f}",
+                "FİYAT": f"{l['c']:.4f}",
                 "KOMUT": komut,
                 "SKOR": puan,
-                "TREND": ana_trend,
-                "RSI": int(rsi)
+                "TREND (EMA200)": trend,
+                "RSI": int(l['RSI'])
             })
-            time.sleep(0.4)
-        except: continue
+            # Binance banlamasın diye küçük bir nefes
+            time.sleep(0.2)
+        except:
+            continue
         progress.progress((idx + 1) / len(symbols))
     
     status.empty()
+    progress.empty()
+    
+    if not results:
+        return pd.DataFrame()
+    
     return pd.DataFrame(results).sort_values('SKOR', ascending=False)
 
 # --- Arayüz ---
-if st.button('🛡️ GOLD ANALİZİ BAŞLAT'):
-    data = heavy_gold_scanner()
+if st.button('🚀 BINANCE FUTURES ANALİZİ BAŞLAT'):
+    data = binance_pro_scanner()
     
     if not data.empty:
-        def style_gold(row):
+        def style_futures(row):
             color = ''
             if row['SKOR'] >= 80:
-                color = 'background-color: #11381b; color: #52ff8f; font-weight: bold' if "LONG" in row['KOMUT'] else 'background-color: #3b0d0d; color: #ff6e6e; font-weight: bold'
+                color = 'background-color: #0c3e1e; color: #52ff8f' if "LONG" in row['KOMUT'] else 'background-color: #4b0a0a; color: #ff6e6e'
             return [color]*len(row)
 
-        st.dataframe(
-            data.style.apply(style_gold, axis=1), 
-            use_container_width=True, 
-            height=650
-        )
+        st.subheader("🎯 Binance İşlem Sinyalleri")
+        st.dataframe(data.style.apply(style_futures, axis=1), use_container_width=True, height=600)
     else:
-        st.error("Veri çekilemedi.")
+        st.warning("⚠️ Şu an kriterlere uyan sinyal bulunamadı. Lütfen piyasayı takipte kalın.")
