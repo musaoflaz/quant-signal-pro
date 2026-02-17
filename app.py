@@ -3,20 +3,12 @@
 # pandas
 # numpy
 # ccxt
-#
-# SECURITY NOTE:
-# - Do NOT hardcode Telegram token in this file.
-# - Prefer Streamlit Cloud -> App settings -> Secrets:
-#   TELEGRAM_BOT_TOKEN="xxxx"
-#   TELEGRAM_CHAT_ID="1358384022"
-# - If you ever shared a token anywhere, rotate it in @BotFather.
 
 from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib import request, parse
 
 import numpy as np
 import pandas as pd
@@ -24,48 +16,52 @@ import streamlit as st
 import ccxt
 
 
-# -----------------------------
-# Config
-# -----------------------------
+# =============================
+# CONFIG
+# =============================
 IST_TZ = ZoneInfo("Europe/Istanbul")
 
+# Base indicators (score engine)
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
 SMA_PERIOD = 20
 
-EMA_REGIME_PERIOD = 200  # 1h EMA200 regime filter
-ADX_PERIOD = 14          # 1h ADX filter
-VOL_SMA_PERIOD = 20      # volume confirmation on base TF
+# PRO/Strict filters (quality gates)
+EMA_REGIME_PERIOD = 200
+ADX_PERIOD = 14
+VOL_SMA_PERIOD = 20
 
-# Raw score gates (unchanged)
+# Strong signal gates (RAW score)
 STRONG_LONG_MIN = 90
 STRONG_SHORT_MAX = 10
 
-# What you want on main screen
-TOP_SHOW = 20
+# When no strong signals exist
+FALLBACK_TOP_N = 10  # show only closest candidates
 
-# Auto scan without clicking (first load)
+# Universe size (KuCoin has many USDT pairs; keep cloud stable)
+DEFAULT_HARD_MAX_SYMBOLS = 600
+DEFAULT_BASE_LIMIT = 200
+
+# Default PRO settings (hard/strict)
+DEFAULT_PRO_MODE = True
+DEFAULT_REQUIRE_REGIME_1H = True
+DEFAULT_REQUIRE_REGIME_4H = True
+DEFAULT_REQUIRE_ADX_1H = True
+DEFAULT_REQUIRE_ADX_4H = True
+DEFAULT_REQUIRE_VOL_CONFIRM = True
+DEFAULT_REQUIRE_SPREAD = True
+
+# Spread filter (orderbook)
+DEFAULT_MAX_SPREAD_PCT = 0.60  # 0.60% is strict; adjust if too few signals
+
+# Auto-scan behavior
 AUTO_SCAN_ON_LOAD = True
 
-# Cloud safety
-DEFAULT_HARD_MAX_SYMBOLS = 500  # keep stable on Streamlit Cloud
-DEFAULT_CANDLE_LIMIT = 200
 
-# Strict filters default (quality > quantity)
-DEFAULT_STRICT_MODE = True
-DEFAULT_REQUIRE_REGIME = True
-DEFAULT_REQUIRE_ADX = True
-DEFAULT_REQUIRE_VOL_CONFIRM = True
-
-# Telegram alert policy (only strong signals)
-ALERT_LONG_RAW_MIN = 90
-ALERT_SHORT_RAW_MAX = 10
-
-
-# -----------------------------
-# Indicators (pure pandas/numpy)
-# -----------------------------
+# =============================
+# Indicator math (pure pandas/numpy)
+# =============================
 def sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period, min_periods=period).mean()
 
@@ -96,7 +92,6 @@ def rsi_wilder(series: pd.Series, period: int) -> pd.Series:
 
 
 def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    # True Range
     prev_close = close.shift(1)
     tr = pd.concat(
         [
@@ -107,7 +102,6 @@ def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -
         axis=1,
     ).max(axis=1)
 
-    # Directional Movement
     up_move = high.diff()
     down_move = -low.diff()
 
@@ -117,7 +111,6 @@ def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -
     plus_dm = pd.Series(plus_dm, index=close.index)
     minus_dm = pd.Series(minus_dm, index=close.index)
 
-    # Wilder smoothing (EMA with alpha=1/period)
     atr = tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     plus_dm_s = plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     minus_dm_s = minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
@@ -130,17 +123,14 @@ def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -
     return adx.fillna(0.0)
 
 
-# -----------------------------
-# Scoring (unchanged logic)
-# -----------------------------
+# =============================
+# Score engine (unchanged style: 50 +/- steps)
+# =============================
 def raw_sniper_score(close: float, sma20_v: float, rsi_v: float, bb_low: float, bb_up: float) -> int:
     score = 50
 
     # Trend Filter (20)
-    if close > sma20_v:
-        score += 20
-    else:
-        score -= 20
+    score += 20 if close > sma20_v else -20
 
     # Momentum Filter (40)
     if rsi_v < 35:
@@ -161,33 +151,26 @@ def direction_from_raw(raw_score: int) -> str:
     return "LONG" if raw_score >= 50 else "SHORT"
 
 
-def confidence_from_raw(raw_score: int) -> int:
-    # Unified 0..100 strength for BOTH directions:
-    # LONG: raw=90 -> 90
-    # SHORT: raw=10 -> 90
-    if raw_score >= 50:
-        return int(raw_score)
-    return int(100 - raw_score)
+def strength_from_raw(raw_score: int) -> int:
+    # unified 0..100 strength:
+    # LONG strength = raw
+    # SHORT strength = 100 - raw
+    return int(raw_score) if raw_score >= 50 else int(100 - raw_score)
 
 
-def signal_label(raw_score: int) -> str:
+def label_from_raw(raw_score: int) -> str:
     if raw_score >= STRONG_LONG_MIN:
-        return "🔥 STRONG LONG SIGNAL"
+        return "🔥 STRONG LONG"
     if raw_score <= STRONG_SHORT_MAX:
-        return "💀 STRONG SHORT SIGNAL"
-    return "⏳ WATCHING"
+        return "💀 STRONG SHORT"
+    return "⏳ WATCH"
 
 
-# -----------------------------
-# KuCoin / CCXT
-# -----------------------------
+# =============================
+# KuCoin / CCXT helpers
+# =============================
 def make_exchange() -> ccxt.kucoin:
-    return ccxt.kucoin(
-        {
-            "enableRateLimit": True,
-            "timeout": 20000,  # ms
-        }
-    )
+    return ccxt.kucoin({"enableRateLimit": True, "timeout": 20000})
 
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -212,160 +195,36 @@ def safe_fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int)
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
 
-# -----------------------------
-# Telegram (stdlib only)
-# -----------------------------
-def telegram_send_message(token: str, chat_id: str, text: str, timeout: int = 12) -> tuple[bool, str]:
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        form = parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
-        req = request.Request(
-            url=url,
-            data=form,
-            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "kucoin-quant-sniper"},
-            method="POST",
-        )
-        with request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-        return True, body[:200]
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-
-def build_alert_message(row: pd.Series, timeframe: str) -> str:
-    return (
-        f"{row['SIGNAL']}\n"
-        f"COIN: {row['COIN']}/USDT\n"
-        f"YÖN: {row['YÖN']}\n"
-        f"SKOR: {int(row['SKOR'])}\n"
-        f"FİYAT: {row['FİYAT']:.4f}\n"
-        f"TF: {timeframe}\n"
-        f"Time(IST): {datetime.now(IST_TZ).strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
-
-def should_alert(alert_state: dict, coin: str, signal: str, cooldown_minutes: int) -> bool:
-    key = f"{coin}|{signal}"
-    last_ts = alert_state.get(key)
-    if not last_ts:
-        return True
-    try:
-        last_dt = datetime.fromisoformat(last_ts)
-    except Exception:
-        return True
-    return datetime.now(IST_TZ) - last_dt >= timedelta(minutes=cooldown_minutes)
-
-
-def mark_alert(alert_state: dict, coin: str, signal: str):
-    key = f"{coin}|{signal}"
-    alert_state[key] = datetime.now(IST_TZ).isoformat()
-
-
-# -----------------------------
-# UI
-# -----------------------------
-st.set_page_config(page_title="KuCoin Quant Sniper (Spot)", layout="wide")
-
-st.markdown(
+def safe_fetch_orderbook_spread_pct(ex: ccxt.Exchange, symbol: str) -> float | None:
     """
-<style>
-html, body, [class*="css"]  { background-color: #0b0f14 !important; }
-.block-container { padding-top: 1.0rem; }
-h1, h2, h3, h4, h5, h6, p, span, div { color: #e6edf3; }
-[data-testid="stSidebar"] { background-color: #0b0f14; border-right: 1px solid #1f2a37; }
-[data-testid="stHeader"] { background: rgba(0,0,0,0); }
-.stButton>button {
-    border: 1px solid #2d3b4d;
-    background: #111827;
-    color: #e6edf3;
-    border-radius: 10px;
-    padding: 0.55rem 0.9rem;
-}
-.stButton>button:hover { border-color: #4b5563; background: #0f172a; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-# Session state
-if "results_df" not in st.session_state:
-    st.session_state["results_df"] = None
-if "last_scan_time" not in st.session_state:
-    st.session_state["last_scan_time"] = None
-if "last_scan_tf" not in st.session_state:
-    st.session_state["last_scan_tf"] = None
-if "alert_state" not in st.session_state:
-    st.session_state["alert_state"] = {}
-if "boot_scanned" not in st.session_state:
-    st.session_state["boot_scanned"] = False
-if "paused" not in st.session_state:
-    st.session_state["paused"] = False
-
-# Telegram defaults from secrets (preferred)
-secret_token = ""
-secret_chat = "1358384022"
-try:
-    secret_token = str(st.secrets.get("TELEGRAM_BOT_TOKEN", "")).strip()
-    secret_chat = str(st.secrets.get("TELEGRAM_CHAT_ID", "1358384022")).strip()
-except Exception:
-    pass
-
-if "tg_token" not in st.session_state:
-    st.session_state["tg_token"] = secret_token
-if "tg_chat_id" not in st.session_state:
-    st.session_state["tg_chat_id"] = secret_chat
-
-
-def try_autorefresh(interval_ms: int, key: str):
+    Returns spread% = (ask-bid)/mid * 100 if available, else None.
+    """
     try:
-        return st.autorefresh(interval=interval_ms, key=key)
-    except Exception:
-        try:
-            return st.experimental_autorefresh(interval=interval_ms, key=key)
-        except Exception:
+        ob = ex.fetch_order_book(symbol, limit=5)
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+        if not bids or not asks:
             return None
+        bid = float(bids[0][0])
+        ask = float(asks[0][0])
+        if bid <= 0 or ask <= 0 or ask <= bid:
+            return None
+        mid = (ask + bid) / 2.0
+        return ((ask - bid) / mid) * 100.0
+    except Exception:
+        return None
 
 
-def style_main_table(df: pd.DataFrame):
-    def score_bg(v):
-        try:
-            v = float(v)
-        except Exception:
-            return ""
-        if v >= 90:
-            return "background-color: #006400; color: #ffffff;"
-        if v <= 60:
-            return "background-color: #1f2937; color: #e5e7eb;"
-        return "background-color: #0f172a; color: #ffffff;"
-
-    def dir_bg(v):
-        s = str(v)
-        if "LONG" in s:
-            return "background-color: #064e3b; color: #ffffff;"
-        if "SHORT" in s:
-            return "background-color: #7f1d1d; color: #ffffff;"
-        return ""
-
-    fmt = {"FİYAT": "{:.4f}", "SKOR": "{:.0f}"}
-
-    return (
-        df.style.format(fmt)
-        .applymap(score_bg, subset=["SKOR"])
-        .applymap(dir_bg, subset=["YÖN"])
-        .set_properties(**{"border-color": "#1f2a37"})
-    )
-
-
-# -----------------------------
-# Core scan with strict filters
-# -----------------------------
-def build_row_from_base_tf(symbol: str, ohlcv: list, base_tf: str) -> dict | None:
+# =============================
+# Build base row (base TF)
+# =============================
+def build_base_row(symbol: str, ohlcv: list, base_tf: str) -> dict | None:
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    close = df["close"].astype(float)
-    volume = df["volume"].astype(float)
-
     if len(df) < max(SMA_PERIOD, BB_PERIOD, RSI_PERIOD, VOL_SMA_PERIOD) + 5:
         return None
+
+    close = df["close"].astype(float)
+    volume = df["volume"].astype(float)
 
     sma20_s = sma(close, SMA_PERIOD)
     _, bb_up_s, bb_low_s = bollinger_bands(close, BB_PERIOD, BB_STD)
@@ -389,246 +248,193 @@ def build_row_from_base_tf(symbol: str, ohlcv: list, base_tf: str) -> dict | Non
         return None
 
     raw = raw_sniper_score(last_close, last_sma20, last_rsi, last_low, last_up)
-    conf = confidence_from_raw(raw)
     yon = direction_from_raw(raw)
-    sig = signal_label(raw)
+    skor = strength_from_raw(raw)
+    etiket = label_from_raw(raw)
 
     coin = symbol.replace("/USDT", "")
-
     return {
         "SYMBOL": symbol,
         "COIN": coin,
-        "FİYAT": last_close,
-        "Change%": chg_pct,
-        "RSI14": last_rsi,
-        "SMA20": last_sma20,
-        "BB_Lower": last_low,
-        "BB_Upper": last_up,
-        "RAW": raw,
-        "SKOR": conf,           # unified 0..100 strength
-        "YÖN": f"🟢 {yon}" if yon == "LONG" else f"🔴 {yon}",
-        "SIGNAL": sig,
+        "YÖN": yon,
+        "RAW": int(raw),
+        "SKOR": int(skor),
+        "FİYAT": float(last_close),
+        "Change%": float(chg_pct),
         "VOL_OK": bool(vol_ok),
+        "ETİKET": etiket,
         "BASE_TF": base_tf,
     }
 
 
-def strict_filters_pass(ex: ccxt.Exchange, symbol: str, want_dir: str, require_regime: bool, require_adx: bool) -> tuple[bool, dict]:
-    """
-    Strict filters on 1h:
-    - Regime: 1h close vs EMA200
-    - ADX: 1h ADX >= 18 (trend strength / stability)
-    """
-    info = {"REGIME_OK": True, "ADX_OK": True, "EMA200_1H": np.nan, "ADX_1H": np.nan}
+# =============================
+# PRO / Strict filters (1h & 4h)
+# =============================
+def strict_pass(
+    ex: ccxt.Exchange,
+    symbol: str,
+    want_dir: str,
+    require_regime_1h: bool,
+    require_regime_4h: bool,
+    require_adx_1h: bool,
+    require_adx_4h: bool,
+    require_spread: bool,
+    max_spread_pct: float,
+) -> tuple[bool, dict]:
+    info = {
+        "EMA200_1H": np.nan,
+        "EMA200_4H": np.nan,
+        "ADX_1H": np.nan,
+        "ADX_4H": np.nan,
+        "SPREAD%": np.nan,
+        "REGIME1H_OK": True,
+        "REGIME4H_OK": True,
+        "ADX1H_OK": True,
+        "ADX4H_OK": True,
+        "SPREAD_OK": True,
+    }
 
-    # Fetch 1h candles
-    # Need EMA200 and ADX14 => ~250 candles is enough
-    try:
-        ohlcv_1h = safe_fetch_ohlcv(ex, symbol, "1h", 260)
-    except Exception:
-        return False, info
-
-    if not ohlcv_1h or len(ohlcv_1h) < max(EMA_REGIME_PERIOD, ADX_PERIOD) + 10:
-        return False, info
-
-    d1 = pd.DataFrame(ohlcv_1h, columns=["ts", "open", "high", "low", "close", "volume"])
-    h = d1["high"].astype(float)
-    l = d1["low"].astype(float)
-    c = d1["close"].astype(float)
-
-    ema200 = ema(c, EMA_REGIME_PERIOD)
-    last_close = float(c.iloc[-1])
-    last_ema200 = float(ema200.iloc[-1]) if not np.isnan(ema200.iloc[-1]) else np.nan
-    info["EMA200_1H"] = last_ema200
-
-    if require_regime:
-        if np.isnan(last_ema200):
-            info["REGIME_OK"] = False
-            return False, info
-        if want_dir == "LONG":
-            info["REGIME_OK"] = last_close > last_ema200
-        else:
-            info["REGIME_OK"] = last_close < last_ema200
-        if not info["REGIME_OK"]:
+    # Spread gate first (fast reject)
+    if require_spread:
+        sp = safe_fetch_orderbook_spread_pct(ex, symbol)
+        info["SPREAD%"] = sp if sp is not None else np.nan
+        if sp is None or sp > max_spread_pct:
+            info["SPREAD_OK"] = False
             return False, info
 
-    if require_adx:
-        adx = adx_wilder(h, l, c, ADX_PERIOD)
-        last_adx = float(adx.iloc[-1]) if not np.isnan(adx.iloc[-1]) else 0.0
-        info["ADX_1H"] = last_adx
-        info["ADX_OK"] = last_adx >= 18.0
-        if not info["ADX_OK"]:
+    # 1h gate
+    if require_regime_1h or require_adx_1h:
+        o1 = safe_fetch_ohlcv(ex, symbol, "1h", 260)
+        if not o1 or len(o1) < max(EMA_REGIME_PERIOD, ADX_PERIOD) + 10:
             return False, info
+        d1 = pd.DataFrame(o1, columns=["ts", "open", "high", "low", "close", "volume"])
+        h1 = d1["high"].astype(float)
+        l1 = d1["low"].astype(float)
+        c1 = d1["close"].astype(float)
+
+        ema200_1h = ema(c1, EMA_REGIME_PERIOD)
+        last_close_1h = float(c1.iloc[-1])
+        last_ema_1h = float(ema200_1h.iloc[-1]) if not np.isnan(ema200_1h.iloc[-1]) else np.nan
+        info["EMA200_1H"] = last_ema_1h
+
+        if require_regime_1h:
+            if np.isnan(last_ema_1h):
+                info["REGIME1H_OK"] = False
+                return False, info
+            info["REGIME1H_OK"] = (last_close_1h > last_ema_1h) if want_dir == "LONG" else (last_close_1h < last_ema_1h)
+            if not info["REGIME1H_OK"]:
+                return False, info
+
+        if require_adx_1h:
+            adx1 = adx_wilder(h1, l1, c1, ADX_PERIOD)
+            last_adx1 = float(adx1.iloc[-1]) if not np.isnan(adx1.iloc[-1]) else 0.0
+            info["ADX_1H"] = last_adx1
+            info["ADX1H_OK"] = last_adx1 >= 20.0
+            if not info["ADX1H_OK"]:
+                return False, info
+
+    # 4h gate
+    if require_regime_4h or require_adx_4h:
+        o4 = safe_fetch_ohlcv(ex, symbol, "4h", 260)
+        if not o4 or len(o4) < max(EMA_REGIME_PERIOD, ADX_PERIOD) + 10:
+            return False, info
+        d4 = pd.DataFrame(o4, columns=["ts", "open", "high", "low", "close", "volume"])
+        h4 = d4["high"].astype(float)
+        l4 = d4["low"].astype(float)
+        c4 = d4["close"].astype(float)
+
+        ema200_4h = ema(c4, EMA_REGIME_PERIOD)
+        last_close_4h = float(c4.iloc[-1])
+        last_ema_4h = float(ema200_4h.iloc[-1]) if not np.isnan(ema200_4h.iloc[-1]) else np.nan
+        info["EMA200_4H"] = last_ema_4h
+
+        if require_regime_4h:
+            if np.isnan(last_ema_4h):
+                info["REGIME4H_OK"] = False
+                return False, info
+            info["REGIME4H_OK"] = (last_close_4h > last_ema_4h) if want_dir == "LONG" else (last_close_4h < last_ema_4h)
+            if not info["REGIME4H_OK"]:
+                return False, info
+
+        if require_adx_4h:
+            adx4 = adx_wilder(h4, l4, c4, ADX_PERIOD)
+            last_adx4 = float(adx4.iloc[-1]) if not np.isnan(adx4.iloc[-1]) else 0.0
+            info["ADX_4H"] = last_adx4
+            info["ADX4H_OK"] = last_adx4 >= 18.0
+            if not info["ADX4H_OK"]:
+                return False, info
 
     return True, info
 
 
-def run_scan(
-    base_tf: str,
-    base_limit: int,
-    hard_max_symbols: int,
-    strict_mode: bool,
-    require_regime: bool,
-    require_adx: bool,
-    require_vol_confirm: bool,
-) -> pd.DataFrame:
-    ex = make_exchange()
-    syms = load_usdt_spot_symbols()
-    universe = syms[: min(len(syms), hard_max_symbols)]
+# =============================
+# Streamlit Styling
+# =============================
+def style_strong_table(df: pd.DataFrame):
+    def dir_style(v):
+        s = str(v)
+        if s == "LONG":
+            return "background-color: #064e3b; color: #ffffff; font-weight: 700;"
+        if s == "SHORT":
+            return "background-color: #7f1d1d; color: #ffffff; font-weight: 700;"
+        return ""
 
-    rows: list[dict] = []
-    progress = st.progress(0, text="Tüm coinler taranıyor…")
-    status = st.empty()
-
-    total = len(universe)
-
-    # 1) Base TF scan for all
-    for i, symbol in enumerate(universe, start=1):
-        progress.progress(int((i - 1) / total * 100), text=f"Base TF {base_tf} -> {symbol} ({i}/{total})")
+    def skor_style(v):
         try:
-            ohlcv = safe_fetch_ohlcv(ex, symbol, base_tf, base_limit)
-            if not ohlcv:
-                continue
-            r = build_row_from_base_tf(symbol, ohlcv, base_tf)
-            if r is None:
-                continue
-            rows.append(r)
-        except (ccxt.RequestTimeout, ccxt.NetworkError):
-            status.warning(f"Timeout/Network issue on {symbol}")
-        except ccxt.ExchangeError:
-            status.info(f"Exchange error on {symbol}")
+            x = float(v)
         except Exception:
-            pass
-        time.sleep(0.02)
+            return ""
+        if x >= 95:
+            return "background-color: #006400; color: #ffffff; font-weight: 800;"
+        if x >= 90:
+            return "background-color: #0f3d0f; color: #ffffff; font-weight: 700;"
+        return "background-color: #111827; color: #e5e7eb;"
 
-    if not rows:
-        progress.progress(100, text="Tarama bitti.")
-        status.empty()
-        return pd.DataFrame()
+    fmt = {"FİYAT": "{:.4f}", "SKOR": "{:.0f}", "RAW": "{:.0f}"}
 
-    df = pd.DataFrame(rows)
-
-    # 2) If strict mode: only check 1h filters for potential strong candidates (cuts API calls)
-    if strict_mode:
-        # Candidate set: strong raw signals only
-        cand = df[(df["RAW"] >= STRONG_LONG_MIN) | (df["RAW"] <= STRONG_SHORT_MAX)].copy()
-        if cand.empty:
-            progress.progress(100, text="Tarama bitti (strict: aday yok).")
-            status.empty()
-            return df.sort_values("SKOR", ascending=False).reset_index(drop=True)
-
-        # Volume confirmation gate (on base TF) if requested
-        if require_vol_confirm:
-            cand = cand[cand["VOL_OK"] == True].copy()
-            if cand.empty:
-                progress.progress(100, text="Tarama bitti (strict: hacim onayı yok).")
-                status.empty()
-                return df.sort_values("SKOR", ascending=False).reset_index(drop=True)
-
-        # Apply 1h strict filters
-        kept = []
-        c_total = len(cand)
-        for j, row in enumerate(cand.itertuples(index=False), start=1):
-            progress.progress(int((j - 1) / max(1, c_total) * 100), text=f"Strict 1h filter ({j}/{c_total})")
-            symbol = getattr(row, "SYMBOL")
-            raw = int(getattr(row, "RAW"))
-            want_dir = "LONG" if raw >= 50 else "SHORT"
-            try:
-                ok, info = strict_filters_pass(ex, symbol, want_dir, require_regime, require_adx)
-                if ok:
-                    kept.append((symbol, info))
-            except Exception:
-                continue
-            time.sleep(0.02)
-
-        if kept:
-            keep_set = {s for s, _ in kept}
-            info_map = {s: info for s, info in kept}
-
-            df["STRICT_OK"] = df["SYMBOL"].isin(keep_set)
-            df["EMA200_1H"] = df["SYMBOL"].map(lambda s: info_map.get(s, {}).get("EMA200_1H", np.nan))
-            df["ADX_1H"] = df["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_1H", np.nan))
-        else:
-            df["STRICT_OK"] = False
-            df["EMA200_1H"] = np.nan
-            df["ADX_1H"] = np.nan
-
-    progress.progress(100, text="Tarama bitti.")
-    status.empty()
-
-    # Sort by unified SKOR (strength)
-    df = df.sort_values("SKOR", ascending=False).reset_index(drop=True)
-    return df
+    return (
+        df.style.format(fmt)
+        .applymap(dir_style, subset=["YÖN"])
+        .applymap(skor_style, subset=["SKOR"])
+        .set_properties(**{"border-color": "#1f2a37"})
+    )
 
 
-def maybe_send_alerts(df: pd.DataFrame, timeframe: str, enable_telegram: bool, tg_token: str, tg_chat_id: str, cooldown_minutes: int):
-    if df is None or df.empty or not enable_telegram:
-        return
-    if not tg_token.strip() or not tg_chat_id.strip():
-        st.warning("Telegram açık ama token/chat_id boş.")
-        return
+# =============================
+# App UI
+# =============================
+st.set_page_config(page_title="KuCoin PRO Sniper (Spot)", layout="wide")
+st.markdown(
+    """
+<style>
+html, body, [class*="css"]  { background-color: #0b0f14 !important; }
+.block-container { padding-top: 1.0rem; }
+h1, h2, h3, h4, h5, h6, p, span, div { color: #e6edf3; }
+[data-testid="stSidebar"] { background-color: #0b0f14; border-right: 1px solid #1f2a37; }
+[data-testid="stHeader"] { background: rgba(0,0,0,0); }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-    alert_state = st.session_state["alert_state"]
+# Session state
+if "results" not in st.session_state:
+    st.session_state["results"] = None
+if "last_scan_time" not in st.session_state:
+    st.session_state["last_scan_time"] = None
+if "boot_scanned" not in st.session_state:
+    st.session_state["boot_scanned"] = False
 
-    # Only strong signals
-    strong = df[(df["RAW"] >= ALERT_LONG_RAW_MIN) | (df["RAW"] <= ALERT_SHORT_RAW_MAX)].copy()
-    if strong.empty:
-        return
-
-    # If strict mode is ON and we computed STRICT_OK, only alert strict OK
-    if "STRICT_OK" in strong.columns:
-        strong = strong[(strong["STRICT_OK"] == True) | (strong["STRICT_OK"].isna())]
-
-    if strong.empty:
-        return
-
-    errors = []
-    sent_any = False
-
-    for _, row in strong.iterrows():
-        coin = str(row["COIN"])
-        sig = str(row["SIGNAL"])
-        if not should_alert(alert_state, coin, sig, cooldown_minutes):
-            continue
-
-        msg = build_alert_message(
-            pd.Series(
-                {
-                    "SIGNAL": row["SIGNAL"],
-                    "COIN": row["COIN"],
-                    "YÖN": row["YÖN"],
-                    "SKOR": row["SKOR"],
-                    "FİYAT": row["FİYAT"],
-                }
-            ),
-            timeframe,
-        )
-        ok, info = telegram_send_message(tg_token.strip(), tg_chat_id.strip(), msg)
-        if not ok:
-            errors.append(f"{coin}: {info}")
-        mark_alert(alert_state, coin, sig)
-        sent_any = True
-
-    if sent_any:
-        st.toast("✅ Telegram bildirim kontrolü tamamlandı.", icon="🔔")
-    if errors:
-        with st.expander("Telegram errors"):
-            for e in errors[:30]:
-                st.write(f"- {e}")
-
-
-# -----------------------------
 # Header
-# -----------------------------
-left, right = st.columns([2, 1], vertical_alignment="center")
-with left:
-    st.title("KuCoin Quant Sniper (Spot) — Top 20 Tablo (Tıklamadan)")
-    st.caption("Skor: RSI(14) + Bollinger(20,2) + SMA(20) • Strict Mode: 1h EMA200 + 1h ADX + Hacim onayı")
-with right:
+c1, c2 = st.columns([2, 1], vertical_alignment="center")
+with c1:
+    st.title("KuCoin PRO Sniper — SERT Sinyal Tablosu (Kalabalık Yok)")
+    st.caption("Sadece en güçlü LONG/SHORT sinyaller (RAW>=90 / RAW<=10) + PRO kapılar (EMA200 1h+4h, ADX 1h+4h, Hacim, Spread).")
+with c2:
     now_ist = datetime.now(IST_TZ)
     st.markdown(
         f"""
-<div style="text-align:right; padding-top: 8px;">
+<div style="text-align:right; padding-top: 6px;">
   <div style="font-size: 12px; opacity: 0.85;">Istanbul Time</div>
   <div style="font-size: 18px; font-weight: 700;">{now_ist.strftime('%Y-%m-%d %H:%M:%S')}</div>
 </div>
@@ -636,155 +442,185 @@ with right:
         unsafe_allow_html=True,
     )
 
-# -----------------------------
 # Sidebar
-# -----------------------------
 with st.sidebar:
-    st.subheader("Kontrol")
+    st.subheader("Ayarlar")
 
-    base_tf = st.selectbox("Timeframe", ["5m", "15m", "30m", "1h"], index=1)
-    base_limit = st.slider("Candles (base TF)", 120, 500, DEFAULT_CANDLE_LIMIT, step=20)
-
-    hard_max = st.slider("Kaç coin taransın (stabilite)", 100, 1200, DEFAULT_HARD_MAX_SYMBOLS, step=50)
-
-    st.write("---")
-    st.subheader("Sinyal Kalitesi (Strict Mode)")
-    strict_mode = st.toggle("Strict Mode (Önerilir)", value=DEFAULT_STRICT_MODE)
-    require_regime = st.toggle("1h EMA200 Rejim Filtresi", value=DEFAULT_REQUIRE_REGIME, disabled=not strict_mode)
-    require_adx = st.toggle("1h ADX >= 18 Filtresi", value=DEFAULT_REQUIRE_ADX, disabled=not strict_mode)
-    require_vol = st.toggle("Hacim Onayı (Vol > SMA20*1.2)", value=DEFAULT_REQUIRE_VOL_CONFIRM, disabled=not strict_mode)
+    base_tf = st.selectbox("Tarama TF", ["5m", "15m", "30m", "1h"], index=1)
+    base_limit = st.slider("Mum sayısı", 120, 500, DEFAULT_BASE_LIMIT, step=20)
+    hard_max = st.slider("Evren (USDT spot) kaç coin taransın", 100, 1200, DEFAULT_HARD_MAX_SYMBOLS, step=50)
 
     st.write("---")
-    st.subheader("Otomatik Tarama")
+    st.subheader("PRO Mod (Önerilir)")
+    pro_mode = st.toggle("PRO Mode", value=DEFAULT_PRO_MODE)
+
+    require_regime_1h = st.toggle("1h EMA200 Rejim", value=DEFAULT_REQUIRE_REGIME_1H, disabled=not pro_mode)
+    require_regime_4h = st.toggle("4h EMA200 Rejim", value=DEFAULT_REQUIRE_REGIME_4H, disabled=not pro_mode)
+    require_adx_1h = st.toggle("1h ADX >= 20", value=DEFAULT_REQUIRE_ADX_1H, disabled=not pro_mode)
+    require_adx_4h = st.toggle("4h ADX >= 18", value=DEFAULT_REQUIRE_ADX_4H, disabled=not pro_mode)
+    require_vol = st.toggle("Hacim Onayı (Vol > SMA20*1.2)", value=DEFAULT_REQUIRE_VOL_CONFIRM, disabled=not pro_mode)
+
+    st.write("---")
+    st.subheader("Spread Filtresi (ÇOK Önemli)")
+    require_spread = st.toggle("Orderbook Spread filtresi", value=DEFAULT_REQUIRE_SPREAD, disabled=not pro_mode)
+    max_spread = st.slider("Max Spread (%)", 0.10, 2.00, float(DEFAULT_MAX_SPREAD_PCT), step=0.05, disabled=not pro_mode)
+
+    st.write("---")
     auto_scan = st.toggle("Auto Scan", value=True)
     refresh_sec = st.slider("Tarama aralığı (sn)", 60, 1800, 240, step=60)
-
-    st.write("---")
-    st.subheader("SİSTEMİ DURDUR")
-    st.session_state["paused"] = st.toggle("Duraklat", value=st.session_state["paused"])
-
-    st.write("---")
-    st.subheader("Telegram (Opsiyonel)")
-    enable_telegram = st.toggle("Enable Telegram", value=False)
-
-    tg_token_in = st.text_input("Telegram Bot Token", value=st.session_state["tg_token"], type="password")
-    tg_chat_in = st.text_input("Chat ID", value=st.session_state["tg_chat_id"])
-    cooldown_minutes = st.slider("Cooldown (dk)", 1, 180, 30, step=1)
-    test_btn = st.button("🔔 Test Notification", use_container_width=True)
-
-    st.session_state["tg_token"] = tg_token_in
-    st.session_state["tg_chat_id"] = tg_chat_in
-
-    st.write("---")
     manual_scan = st.button("🚀 Hemen Tara", use_container_width=True)
 
+# Autorefresh
+def try_autorefresh(interval_ms: int, key: str):
+    try:
+        return st.autorefresh(interval=interval_ms, key=key)
+    except Exception:
+        try:
+            return st.experimental_autorefresh(interval=interval_ms, key=key)
+        except Exception:
+            return None
 
-# Auto refresh
-if auto_scan and not st.session_state["paused"]:
-    try_autorefresh(interval_ms=int(refresh_sec * 1000), key="kucoin_auto_refresh")
-
-
-# Telegram test
-if test_btn:
-    if not st.session_state["tg_token"].strip():
-        st.error("Token boş. Secrets veya input ile gir.")
-    elif not st.session_state["tg_chat_id"].strip():
-        st.error("Chat ID boş.")
-    else:
-        msg = f"✅ Test Notification\nTime(IST): {datetime.now(IST_TZ).strftime('%Y-%m-%d %H:%M:%S')}\nTF: {base_tf}"
-        ok, info = telegram_send_message(st.session_state["tg_token"].strip(), st.session_state["tg_chat_id"].strip(), msg)
-        if ok:
-            st.success("Test mesajı Telegram’a gönderildi.")
-        else:
-            st.error(f"Test failed: {info}")
-
+if auto_scan:
+    try_autorefresh(interval_ms=int(refresh_sec * 1000), key="pro_sniper_refresh")
 
 # Decide scan
 do_scan = False
-if AUTO_SCAN_ON_LOAD and not st.session_state["boot_scanned"] and not st.session_state["paused"]:
+if AUTO_SCAN_ON_LOAD and not st.session_state["boot_scanned"]:
     do_scan = True
-elif manual_scan and not st.session_state["paused"]:
+elif manual_scan:
     do_scan = True
-elif auto_scan and not st.session_state["paused"]:
-    last_scan = st.session_state.get("last_scan_time")
-    if last_scan is None:
+elif auto_scan:
+    last = st.session_state.get("last_scan_time")
+    if last is None or (datetime.now(IST_TZ) - last >= timedelta(seconds=refresh_sec)):
         do_scan = True
-    else:
-        if datetime.now(IST_TZ) - last_scan >= timedelta(seconds=refresh_sec):
-            do_scan = True
-
 
 # Run scan
 if do_scan:
-    try:
-        df_out = run_scan(
-            base_tf=base_tf,
-            base_limit=base_limit,
-            hard_max_symbols=hard_max,
-            strict_mode=strict_mode,
-            require_regime=require_regime,
-            require_adx=require_adx,
-            require_vol_confirm=require_vol,
-        )
-        st.session_state["results_df"] = df_out
-        st.session_state["last_scan_time"] = datetime.now(IST_TZ)
-        st.session_state["last_scan_tf"] = base_tf
-        st.session_state["boot_scanned"] = True
+    ex = make_exchange()
+    syms = load_usdt_spot_symbols()
+    universe = syms[: min(len(syms), hard_max)]
 
-        maybe_send_alerts(
-            df=df_out,
-            timeframe=base_tf,
-            enable_telegram=enable_telegram,
-            tg_token=st.session_state["tg_token"],
-            tg_chat_id=st.session_state["tg_chat_id"],
-            cooldown_minutes=cooldown_minutes,
-        )
-    except Exception as e:
-        st.error(f"Scan failed: {type(e).__name__}: {e}")
+    progress = st.progress(0, text="Taranıyor…")
+    status = st.empty()
 
+    rows = []
+    total = len(universe)
 
-# -----------------------------
-# MAIN SCREEN TABLE (no clicking)
-# -----------------------------
-df_res = st.session_state.get("results_df")
-son_tarama = st.session_state["last_scan_time"].strftime("%H:%M:%S") if st.session_state["last_scan_time"] else "—"
-st.markdown(f"**🕒 Son Tarama:** `{son_tarama}`  •  **TF:** `{st.session_state.get('last_scan_tf') or base_tf}`")
+    # Phase 1: base TF scan
+    for i, symbol in enumerate(universe, start=1):
+        progress.progress(int((i - 1) / max(1, total) * 100), text=f"{base_tf} -> {symbol} ({i}/{total})")
+        try:
+            o = safe_fetch_ohlcv(ex, symbol, base_tf, base_limit)
+            if not o:
+                continue
+            r = build_base_row(symbol, o, base_tf)
+            if r is None:
+                continue
+            rows.append(r)
+        except (ccxt.RequestTimeout, ccxt.NetworkError):
+            status.warning(f"Timeout: {symbol}")
+        except Exception:
+            pass
+        time.sleep(0.02)
 
-if isinstance(df_res, pd.DataFrame) and not df_res.empty:
-    # If strict mode computed STRICT_OK, prioritize strict-ok rows first
-    if "STRICT_OK" in df_res.columns and strict_mode:
-        df_rank = df_res.copy()
-        df_rank["__prio"] = np.where(df_rank["STRICT_OK"] == True, 1, 0)
-        df_rank = df_rank.sort_values(["__prio", "SKOR"], ascending=[False, False]).drop(columns=["__prio"])
-    else:
-        df_rank = df_res.sort_values("SKOR", ascending=False)
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    top20 = df_rank.head(TOP_SHOW).copy()
+    # Phase 2: strong candidates only + PRO gates
+    strong_df = pd.DataFrame()
+    if not df.empty:
+        cand = df[(df["RAW"] >= STRONG_LONG_MIN) | (df["RAW"] <= STRONG_SHORT_MAX)].copy()
 
-    # The exact simple table you asked (COIN / YÖN / SKOR / FİYAT)
-    main_table = pd.DataFrame(
-        {
-            "COIN": top20["COIN"],
-            "YÖN": top20["YÖN"],
-            "SKOR": top20["SKOR"].astype(int),
-            "FİYAT": top20["FİYAT"].astype(float),
-        }
-    )
+        # volume gate (base tf)
+        if pro_mode and require_vol:
+            cand = cand[cand["VOL_OK"] == True].copy()
 
-    # Show immediately
-    st.dataframe(style_main_table(main_table), use_container_width=True, height=540)
+        if not cand.empty and pro_mode:
+            kept = []
+            c_total = len(cand)
+            for j, row in enumerate(cand.itertuples(index=False), start=1):
+                progress.progress(int((j - 1) / max(1, c_total) * 100), text=f"PRO kapılar (1h/4h) {j}/{c_total}")
+                symbol = getattr(row, "SYMBOL")
+                raw = int(getattr(row, "RAW"))
+                want_dir = "LONG" if raw >= 50 else "SHORT"
+                ok, info = strict_pass(
+                    ex=ex,
+                    symbol=symbol,
+                    want_dir=want_dir,
+                    require_regime_1h=require_regime_1h,
+                    require_regime_4h=require_regime_4h,
+                    require_adx_1h=require_adx_1h,
+                    require_adx_4h=require_adx_4h,
+                    require_spread=require_spread,
+                    max_spread_pct=max_spread,
+                )
+                if ok:
+                    kept.append((symbol, info))
+                time.sleep(0.02)
 
-    # Optional detail tabs (keep your existing structure, but main table already shows)
-    with st.expander("Detay (opsiyonel)", expanded=False):
-        cols = ["COIN", "SYMBOL", "YÖN", "SKOR", "RAW", "FİYAT", "Change%", "RSI14", "SMA20", "BB_Lower", "BB_Upper", "VOL_OK"]
-        if "EMA200_1H" in df_res.columns:
-            cols += ["EMA200_1H"]
-        if "ADX_1H" in df_res.columns:
-            cols += ["ADX_1H"]
-        if "STRICT_OK" in df_res.columns:
-            cols += ["STRICT_OK"]
-        show = df_res[cols].copy()
-        st.dataframe(show, use_container_width=True, height=520)
+            if kept:
+                info_map = {s: inf for s, inf in kept}
+                keep_set = set(info_map.keys())
+                strong_df = cand[cand["SYMBOL"].isin(keep_set)].copy()
+                strong_df["SPREAD%"] = strong_df["SYMBOL"].map(lambda s: info_map.get(s, {}).get("SPREAD%", np.nan))
+                strong_df["ADX_1H"] = strong_df["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_1H", np.nan))
+                strong_df["ADX_4H"] = strong_df["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_4H", np.nan))
+            else:
+                strong_df = pd.DataFrame()
+        else:
+            # pro_mode off: strong signals are only raw gates (+ optional vol if on)
+            strong_df = cand.copy()
 
+    progress.progress(100, text="Tarama bitti.")
+    status.empty()
+
+    st.session_state["results"] = {"all": df, "strong": strong_df}
+    st.session_state["last_scan_time"] = datetime.now(IST_TZ)
+    st.session_state["boot_scanned"] = True
+
+# Show results
+res = st.session_state.get("results")
+last_scan = st.session_state.get("last_scan_time")
+son = last_scan.strftime("%H:%M:%S") if last_scan else "—"
+st.markdown(f"**🕒 Son Tarama:** `{son}`  •  **TF:** `{base_tf}`")
+
+if not res or not isinstance(res, dict):
+    st.info("İlk tarama başlatılıyor…")
 else:
-    st.info("İlk tarama başlatılıyor… (tablo birazdan dolacak)")
+    df_all = res.get("all")
+    df_strong = res.get("strong")
+
+    # Strong table first (the one you want)
+    if isinstance(df_strong, pd.DataFrame) and not df_strong.empty:
+        show_cols = ["COIN", "YÖN", "SKOR", "FİYAT", "RAW", "ETİKET"]
+        # add PRO diagnostics if present
+        if "SPREAD%" in df_strong.columns:
+            show_cols += ["SPREAD%"]
+        if "ADX_1H" in df_strong.columns:
+            show_cols += ["ADX_1H"]
+        if "ADX_4H" in df_strong.columns:
+            show_cols += ["ADX_4H"]
+
+        out = df_strong.copy()
+        out = out.sort_values(["SKOR", "RAW"], ascending=[False, False]).reset_index(drop=True)
+        out = out.loc[:, [c for c in show_cols if c in out.columns]]
+
+        # Keep it NOT crowded
+        st.subheader("✅ EN GÜÇLÜ SİNYALLER (SERT)")
+        st.dataframe(style_strong_table(out), use_container_width=True, height=520)
+
+    else:
+        st.subheader("⚠️ Şu an STRONG (RAW>=90 / RAW<=10) yok")
+        st.caption("Kalabalık yapmıyorum. En yakın adaylardan sadece ilk 10’u gösteriyorum (STRONG DEĞİL).")
+
+        if isinstance(df_all, pd.DataFrame) and not df_all.empty:
+            # proximity to strong:
+            # for LONG side: closeness = RAW (higher is closer to 90)
+            # for SHORT side: closeness = (100-RAW) (higher is closer to 10)
+            tmp = df_all.copy()
+            tmp["YAKINLIK"] = tmp["SKOR"]  # already unified strength
+            tmp = tmp.sort_values("YAKINLIK", ascending=False).head(FALLBACK_TOP_N).reset_index(drop=True)
+
+            fallback = tmp[["COIN", "YÖN", "SKOR", "FİYAT", "RAW"]].copy()
+            st.dataframe(style_strong_table(fallback), use_container_width=True, height=420)
+        else:
+            st.info("Veri gelmedi. Evren/tf ayarını değiştirip tekrar tara.")
