@@ -19,30 +19,30 @@ def telegram_yolla(mesaj):
 
 exchange = ccxt.kucoin({'enableRateLimit': True})
 
-st.set_page_config(page_title="Alpha Sniper 7/24 Guardian", layout="wide")
-st.title("🛡️ ALPHA SNIPER V42: GUARDIAN")
+st.set_page_config(page_title="Alpha Sniper Balanced", layout="wide")
+st.title("🛡️ ALPHA SNIPER V42: BALANCED ELITE")
 
 if 'bot_active' not in st.session_state:
     st.session_state.bot_active = False
 
 c1, c2 = st.columns(2)
 with c1:
-    if st.button("🚀 SİSTEMİ 7/24 BAŞLAT"):
+    if st.button("🚀 SİSTEMİ BAŞLAT"):
         st.session_state.bot_active = True
-        telegram_yolla("✅ *Gözcü Sistemi Başlatıldı!*\n- 100 Puan: *Anlık Bildirim*\n- Piyasa Özeti: *20 Dakikada Bir*")
+        telegram_yolla("✅ *Sistem Dengeli Modda Başlatıldı!* \n- 100 Puan: *Anlık Bildirim*\n- Piyasa Özeti: *20 Dakikada Bir*")
 
 with c2:
     if st.button("🛑 SİSTEMİ DURDUR"):
         st.session_state.bot_active = False
-        telegram_yolla("⚠️ *Sistem Durduruldu!*")
+        telegram_yolla("⚠️ *Sistem Kapatıldı!*")
 
-# Takip Edilecek Geniş Liste
+# Takip Listesi
 symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'FET/USDT', 'SUI/USDT', 'NEAR/USDT', 'RNDR/USDT', 'TIA/USDT', 'ARB/USDT', 'OP/USDT', 'LINK/USDT', 'DOT/USDT']
 
 placeholder = st.empty()
 
 if st.session_state.bot_active:
-    last_report_time = 0 # İlk raporu hemen atması için
+    last_report_time = 0 
     
     while st.session_state.bot_active:
         current_time = time.time()
@@ -53,7 +53,7 @@ if st.session_state.bot_active:
                 bars = exchange.fetch_ohlcv(s, timeframe='1h', limit=200)
                 df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
                 
-                # --- ULTRA SERT ANALİZ ---
+                # --- DENGELİ TEKNİK ANALİZ ---
                 df['EMA200'] = ta.ema(df['c'], length=200)
                 df['RSI'] = ta.rsi(df['c'], length=14)
                 stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
@@ -64,41 +64,42 @@ if st.session_state.bot_active:
                 sd = [col for col in df.columns if 'STOCHRSId' in col][0]
                 
                 skor = 0
-                if l['c'] > l['EMA200'] and l['EMA200'] > df['EMA200'].iloc[-5]: skor += 30
-                if p[sk] < p[sd] and l[sk] > l[sd] and l[sk] < 25: skor += 40
-                if l['v'] > (df['v'].tail(15).mean() * 1.5): skor += 20
-                if 45 <= l['RSI'] <= 60: skor += 10
+                # 1. Trend (30 Puan): Fiyat EMA200 üzerinde mi?
+                if l['c'] > l['EMA200']: 
+                    skor += 30
                 
-                results.append({"COIN": s.replace('/USDT',''), "SKOR": skor, "FİYAT": l['c']})
+                # 2. Stoch RSI (40 Puan): 40 seviyesinin altında yukarı kesişim?
+                if p[sk] < p[sd] and l[sk] > l[sd] and l[sk] < 40: 
+                    skor += 40
                 
-                # --- ACİL DURUM: 100 PUAN ---
+                # 3. Hacim (20 Puan): Son mum hacmi ortalamanın üzerinde mi?
+                if l['v'] > df['v'].tail(15).mean(): 
+                    skor += 20
+                
+                # 4. RSI (10 Puan): RSI sağlıklı bölgede mi?
+                if 35 <= l['RSI'] <= 65: 
+                    skor += 10
+                
+                results.append({"COIN": s.replace('/USDT',''), "SKOR": skor, "FİYAT": l['c'], "RSI": int(l['RSI'])})
+                
                 if skor >= 100:
-                    telegram_yolla(f"🚨 *ACİL SİNYAL: 100 PUAN!* 🚨\n\n*Coin:* {s}\n*Fiyat:* {l['c']}\n*Durum:* Kusursuz Giriş Şartları Oluştu!")
+                    telegram_yolla(f"🎯 *SİNYAL: 100 PUAN!* 🎯\n\n*Coin:* {s}\n*Fiyat:* {l['c']}\n*Skor:* 100/100\n_Filtrelerden başarıyla geçti!_")
             except:
                 continue
         
         final_df = pd.DataFrame(results).sort_values(by="SKOR", ascending=False)
         
-        # Streamlit Ekranını Güncelle
         with placeholder.container():
             st.write(f"⏱️ Son Tarama: {datetime.now().strftime('%H:%M:%S')}")
             st.table(final_df)
         
-        # --- 20 DAKİKADA BİR TABLO RAPORU ---
-        # 20 dakika = 1200 saniye
+        # 20 Dakikalık Rapor
         if (current_time - last_report_time) >= 1200:
-            rapor = "📋 *20 Dakikalık Piyasa Özeti*\n"
-            rapor += "--------------------------\n"
+            rapor = "📋 *Piyasa Özeti*\n"
             for _, row in final_df.head(10).iterrows():
-                # Skorlara göre emoji ekleyelim
-                emoji = "⚪"
-                if row['SKOR'] >= 70: emoji = "🔥"
-                elif row['SKOR'] >= 30: emoji = "👀"
-                
-                rapor += f"{emoji} *{row['COIN']}*: {row['SKOR']} Puan | {row['FİYAT']}\n"
-            
+                emoji = "🟢" if row['SKOR'] >= 70 else "🟡" if row['SKOR'] >= 30 else "⚪"
+                rapor += f"{emoji} *{row['COIN']}*: {row['SKOR']} Puan | F: {row['FİYAT']}\n"
             telegram_yolla(rapor)
             last_report_time = current_time
         
-        # Tarama aralığı (Dakikada bir piyasayı kontrol eder ama raporu 20 dk'da bir atar)
         time.sleep(60)
