@@ -1,5 +1,9 @@
 streamlit
 pandas
+numpy
 ccxt
-pandas_ta
-plotly
+python-telegram-bot
+ta
+requests
+schedule
+pytz
