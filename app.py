@@ -4,6 +4,8 @@
 # numpy
 # ccxt
 
+from __future__ import annotations
+
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -76,7 +78,7 @@ def make_exchange() -> ccxt.kucoin:
 def load_usdt_spot_symbols() -> list[str]:
     ex = make_exchange()
     markets = ex.load_markets()
-    syms = []
+    syms: list[str] = []
     for sym, m in markets.items():
         if not m:
             continue
@@ -259,7 +261,8 @@ def try_autorefresh(interval_ms: int, key: str):
             return None
 
 
-def style_scores(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+# ✅ FIX: removed problematic pandas Styler return annotation for Streamlit Cloud compatibility
+def style_scores(df: pd.DataFrame):
     def score_bg(v):
         try:
             v = float(v)
@@ -443,12 +446,10 @@ with st.sidebar:
     st.subheader("Telegram (Kolay Mod)")
     enable_telegram = st.toggle("Enable Telegram", value=False)
 
-    # Token: password type (won't show plain)
     tg_token_in = st.text_input("Telegram Bot Token", value=st.session_state["tg_token"], type="password")
     tg_chat_in = st.text_input("Chat ID", value=st.session_state["tg_chat_id"])
     cooldown_minutes = st.slider("Cooldown (min)", 1, 180, 30, step=1)
 
-    # Persist in session (only in this browser session)
     st.session_state["tg_token"] = tg_token_in
     st.session_state["tg_chat_id"] = tg_chat_in
 
@@ -517,7 +518,7 @@ with info_row[0]:
     else:
         st.metric("Last Scan (IST)", "—")
 with info_row[1]:
-    st.metric("Timeframe", st.session_state["last_scan_tf"] or timeframe)
+    st.metric("Timeframe", st.session_state.get("last_scan_tf") or timeframe)
 with info_row[2]:
     st.metric("Assets Scored", str(len(df_res)) if isinstance(df_res, pd.DataFrame) and not df_res.empty else "0")
 with info_row[3]:
