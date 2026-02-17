@@ -22,16 +22,25 @@ import ccxt
 # -----------------------------
 IST_TZ = ZoneInfo("Europe/Istanbul")
 
-CANDLE_LIMIT = 200
+CANDLE_LIMIT_DEFAULT = 200
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
 SMA_PERIOD = 20
 
-TOP_N = 100
-
+# Score gates
 STRONG_LONG_MIN = 90
 STRONG_SHORT_MAX = 10
+
+# What user wants: ALL coins -> pick top 20 by score
+TOP_SHOW = 20
+
+# Auto scan once on first load (no click needed)
+AUTO_SCAN_ON_LOAD = True
+
+# Safety: KuCoin USDT pairs can be many. This is a hard ceiling to avoid Cloud timeouts.
+# You can increase if you want, but this default keeps it usable.
+HARD_MAX_SYMBOLS = 500  # scans first N symbols alphabetically (still "all" up to this cap)
 
 
 # -----------------------------
@@ -92,36 +101,6 @@ def load_usdt_spot_symbols() -> list[str]:
     return sorted(set(syms))
 
 
-def safe_fetch_tickers(ex: ccxt.Exchange, symbols: list[str]) -> dict:
-    try:
-        return ex.fetch_tickers(symbols)
-    except Exception:
-        try:
-            all_t = ex.fetch_tickers()
-            return {s: all_t.get(s) for s in symbols if s in all_t}
-        except Exception:
-            return {}
-
-
-def compute_liquidity_rank(ticker: dict) -> float:
-    if not ticker or not isinstance(ticker, dict):
-        return 0.0
-    qv = ticker.get("quoteVolume")
-    if qv is not None:
-        try:
-            return float(qv)
-        except Exception:
-            pass
-    bv = ticker.get("baseVolume")
-    last = ticker.get("last")
-    try:
-        if bv is not None and last is not None:
-            return float(bv) * float(last)
-    except Exception:
-        pass
-    return 0.0
-
-
 def safe_fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int):
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
@@ -129,19 +108,19 @@ def safe_fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int)
 def score_asset(close: float, sma20_v: float, rsi_v: float, bb_low: float, bb_up: float) -> int:
     score = 50
 
-    # Trend Filter (20)
+    # Trend Filter (20 pts)
     if close > sma20_v:
         score += 20
     else:
         score -= 20
 
-    # Momentum Filter (40)
+    # Momentum Filter (40 pts)
     if rsi_v < 35:
         score += 40
     elif rsi_v > 65:
         score -= 40
 
-    # Volatility Filter (40)
+    # Volatility Filter (40 pts)
     if close <= bb_low:
         score += 40
     elif close >= bb_up:
@@ -182,6 +161,7 @@ def build_alert_message(row: pd.Series, timeframe: str) -> str:
     return (
         f"{row['Signal']}\n"
         f"Symbol: {row['Symbol']}\n"
+        f"Direction: {row['Direction']}\n"
         f"TF: {timeframe}\n"
         f"Score: {int(row['Score'])}\n"
         f"Last: {row['Last']:.4f}\n"
@@ -249,6 +229,8 @@ if "tg_token" not in st.session_state:
     st.session_state["tg_token"] = ""
 if "tg_chat_id" not in st.session_state:
     st.session_state["tg_chat_id"] = "1358384022"
+if "boot_scanned" not in st.session_state:
+    st.session_state["boot_scanned"] = False
 
 
 def try_autorefresh(interval_ms: int, key: str):
@@ -261,7 +243,6 @@ def try_autorefresh(interval_ms: int, key: str):
             return None
 
 
-# ✅ FIX: removed problematic pandas Styler return annotation for Streamlit Cloud compatibility
 def style_scores(df: pd.DataFrame):
     def score_bg(v):
         try:
@@ -275,35 +256,29 @@ def style_scores(df: pd.DataFrame):
         return ""
 
     fmt = {
-        "Last": "{:.4f}",
-        "Change%": "{:.2f}",
-        "RSI14": "{:.2f}",
-        "SMA20": "{:.4f}",
-        "BB_Lower": "{:.4f}",
-        "BB_Upper": "{:.4f}",
+        "FIYAT": "{:.4f}",
+        "SKOR": "{:.0f}",
     }
 
     return (
         df.style.format(fmt)
-        .applymap(score_bg, subset=["Score"])
+        .applymap(score_bg, subset=["SKOR"])
         .set_properties(**{"border-color": "#1f2a37"})
     )
 
 
-def run_scan(symbols: list[str], timeframe: str, limit: int) -> pd.DataFrame:
+def run_scan_all(symbols: list[str], timeframe: str, limit: int) -> pd.DataFrame:
     ex = make_exchange()
 
-    tickers = safe_fetch_tickers(ex, symbols)
-    ranked = [(s, compute_liquidity_rank(tickers.get(s))) for s in symbols]
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    top_symbols = [s for s, _ in ranked[:TOP_N]]
+    # HARD CAP to keep Streamlit Cloud stable
+    universe = symbols[: min(len(symbols), HARD_MAX_SYMBOLS)]
 
     rows = []
-    progress = st.progress(0, text="Scanning markets…")
+    progress = st.progress(0, text="Tüm coinler taranıyor…")
     status = st.empty()
 
-    total = len(top_symbols)
-    for i, symbol in enumerate(top_symbols, start=1):
+    total = len(universe)
+    for i, symbol in enumerate(universe, start=1):
         progress.progress(int((i - 1) / total * 100), text=f"Fetching {symbol} ({i}/{total})")
         try:
             ohlcv = safe_fetch_ohlcv(ex, symbol, timeframe, limit)
@@ -332,6 +307,8 @@ def run_scan(symbols: list[str], timeframe: str, limit: int) -> pd.DataFrame:
             score = score_asset(last_close, last_sma20, last_rsi, last_low, last_up)
             sig = signal_label(score)
 
+            direction = "🟢 LONG" if last_close > last_sma20 else "🔴 SHORT"
+
             rows.append(
                 {
                     "Symbol": symbol,
@@ -343,6 +320,7 @@ def run_scan(symbols: list[str], timeframe: str, limit: int) -> pd.DataFrame:
                     "BB_Upper": last_up,
                     "Score": score,
                     "Signal": sig,
+                    "Direction": direction,
                 }
             )
 
@@ -353,22 +331,18 @@ def run_scan(symbols: list[str], timeframe: str, limit: int) -> pd.DataFrame:
         except Exception:
             status.info(f"Skipped {symbol}")
 
-        time.sleep(0.05)
+        time.sleep(0.03)
 
-    progress.progress(100, text="Scan complete.")
+    progress.progress(100, text="Tarama bitti.")
     status.empty()
 
     out = pd.DataFrame(rows)
     if out.empty:
         return out
 
-    out["SignalClass"] = np.select(
-        [out["Score"] >= STRONG_LONG_MIN, out["Score"] <= STRONG_SHORT_MAX],
-        [2, 0],
-        default=1,
-    )
-    out = out.sort_values(["SignalClass", "Score"], ascending=[False, False]).drop(columns=["SignalClass"])
-    return out.reset_index(drop=True)
+    # sort by Score DESC (user wants highest scores)
+    out = out.sort_values(["Score"], ascending=[False]).reset_index(drop=True)
+    return out
 
 
 def maybe_send_alerts(df: pd.DataFrame, timeframe: str, enable_telegram: bool, tg_token: str, tg_chat_id: str, cooldown_minutes: int):
@@ -413,7 +387,7 @@ def maybe_send_alerts(df: pd.DataFrame, timeframe: str, enable_telegram: bool, t
 # -----------------------------
 left, right = st.columns([2, 1], vertical_alignment="center")
 with left:
-    st.title("KuCoin Quant Sniper (Spot Market) — Top 100 USDT Pairs")
+    st.title("KuCoin Quant Sniper (Spot Market) — Tüm USDT Coinler → Top 20 (Skora göre)")
     st.caption("RSI(14), Bollinger(20,2), SMA(20) • Sniper Score (0–100) • CCXT (Rate Limit On)")
 with right:
     now_ist = datetime.now(IST_TZ)
@@ -429,18 +403,21 @@ with right:
 
 
 # -----------------------------
-# Sidebar
+# Sidebar (optional controls; main table shows without clicking)
 # -----------------------------
 with st.sidebar:
     st.subheader("Controls")
     timeframe = st.selectbox("Timeframe", ["5m", "15m", "30m", "1h", "4h", "1d"], index=1)
-    limit = st.slider("Candles (limit)", min_value=100, max_value=500, value=CANDLE_LIMIT, step=50)
-    scan_btn = st.button("🚀 Scan Top 100", use_container_width=True)
+    limit = st.slider("Candles (limit)", min_value=100, max_value=500, value=CANDLE_LIMIT_DEFAULT, step=50)
+
+    scan_btn = st.button("🚀 Scan Now", use_container_width=True)
 
     st.write("---")
     st.subheader("Auto Scan")
     auto_scan = st.toggle("Enable Auto Scan", value=False)
-    refresh_sec = st.slider("Auto Scan Interval (sec)", 15, 600, 60, step=15)
+    refresh_sec = st.slider("Auto Scan Interval (sec)", 30, 900, 120, step=30)
+
+    st.caption(f"Universe: All USDT spot (hard cap {HARD_MAX_SYMBOLS} symbols for stability)")
 
     st.write("---")
     st.subheader("Telegram (Kolay Mod)")
@@ -455,16 +432,18 @@ with st.sidebar:
 
     test_btn = st.button("🔔 Test Notification", use_container_width=True)
 
+
 # Auto refresh
 if auto_scan:
     try_autorefresh(interval_ms=int(refresh_sec * 1000), key="kucoin_auto_refresh")
+
 
 # Test notification
 if test_btn:
     if not st.session_state["tg_token"].strip():
         st.error("Token boş. Sidebar’a token yapıştır.")
     elif not st.session_state["tg_chat_id"].strip():
-        st.error("Chat ID boş. 1358384022 yaz.")
+        st.error("Chat ID boş.")
     else:
         msg = f"✅ Test Notification\nTime(IST): {datetime.now(IST_TZ).strftime('%Y-%m-%d %H:%M:%S')}\nTF: {timeframe}"
         ok, info = telegram_send_message(st.session_state["tg_token"].strip(), st.session_state["tg_chat_id"].strip(), msg)
@@ -473,9 +452,13 @@ if test_btn:
         else:
             st.error(f"Test failed: {info}")
 
-# Decide scanning
+
+# Decide scanning (no click needed on first load)
 do_scan = False
-if scan_btn:
+
+if AUTO_SCAN_ON_LOAD and not st.session_state["boot_scanned"]:
+    do_scan = True
+elif scan_btn:
     do_scan = True
 elif auto_scan:
     last_scan = st.session_state.get("last_scan_time")
@@ -485,6 +468,7 @@ elif auto_scan:
         if datetime.now(IST_TZ) - last_scan >= timedelta(seconds=refresh_sec):
             do_scan = True
 
+
 # Run scan
 if do_scan:
     try:
@@ -492,10 +476,11 @@ if do_scan:
         if not syms:
             st.error("No USDT spot symbols found.")
         else:
-            df_out = run_scan(syms, timeframe, limit)
+            df_out = run_scan_all(syms, timeframe, limit)
             st.session_state["results_df"] = df_out
             st.session_state["last_scan_time"] = datetime.now(IST_TZ)
             st.session_state["last_scan_tf"] = timeframe
+            st.session_state["boot_scanned"] = True
 
             maybe_send_alerts(
                 df=df_out,
@@ -508,32 +493,32 @@ if do_scan:
     except Exception as e:
         st.error(f"Scan failed: {type(e).__name__}: {e}")
 
-# Metrics
+
+# -----------------------------
+# Main: show table immediately (Top 20 by Score)
+# -----------------------------
 df_res = st.session_state.get("results_df")
 
-info_row = st.columns([1, 2, 1, 1])
-with info_row[0]:
-    if st.session_state["last_scan_time"]:
-        st.metric("Last Scan (IST)", st.session_state["last_scan_time"].strftime("%H:%M:%S"))
-    else:
-        st.metric("Last Scan (IST)", "—")
-with info_row[1]:
-    st.metric("Timeframe", st.session_state.get("last_scan_tf") or timeframe)
-with info_row[2]:
-    st.metric("Assets Scored", str(len(df_res)) if isinstance(df_res, pd.DataFrame) and not df_res.empty else "0")
-with info_row[3]:
-    if isinstance(df_res, pd.DataFrame) and not df_res.empty:
-        longs = int((df_res["Score"] >= STRONG_LONG_MIN).sum())
-        shorts = int((df_res["Score"] <= STRONG_SHORT_MAX).sum())
-        st.metric("🔥 Long / 💀 Short", f"{longs} / {shorts}")
-    else:
-        st.metric("🔥 Long / 💀 Short", "—")
+son_tarama = st.session_state["last_scan_time"].strftime("%H:%M:%S") if st.session_state["last_scan_time"] else "—"
+st.markdown(f"**🕒 Son Tarama:** `{son_tarama}`")
 
-st.write("")
-
-# Tabs
 if isinstance(df_res, pd.DataFrame) and not df_res.empty:
-    cols = ["Symbol", "Last", "Change%", "RSI14", "SMA20", "BB_Lower", "BB_Upper", "Score", "Signal"]
+    top20 = df_res.sort_values("Score", ascending=False).head(TOP_SHOW).copy()
+
+    # Build the simple table like your screenshot (COIN/YÖN/SKOR/FİYAT)
+    table = pd.DataFrame(
+        {
+            "COIN": top20["Symbol"].str.replace("/USDT", "", regex=False),
+            "YÖN": top20["Direction"],
+            "SKOR": top20["Score"].astype(int),
+            "FIYAT": top20["Last"].astype(float),
+        }
+    )
+
+    st.dataframe(style_scores(table), use_container_width=True, height=520)
+
+    # Keep existing detailed tabs below (not required to click, but available)
+    cols = ["Symbol", "Last", "Change%", "RSI14", "SMA20", "BB_Lower", "BB_Upper", "Score", "Signal", "Direction"]
     df_show = df_res.loc[:, cols].copy()
 
     tab_long, tab_short, tab_watch, tab_all = st.tabs(["🔥 Longs", "💀 Shorts", "⏳ Watching", "📋 All"])
@@ -543,20 +528,21 @@ if isinstance(df_res, pd.DataFrame) and not df_res.empty:
         if d.empty:
             st.info("No STRONG LONG signals right now.")
         else:
-            st.dataframe(style_scores(d), use_container_width=True, height=650)
+            st.dataframe(d, use_container_width=True, height=650)
 
     with tab_short:
         d = df_show[df_show["Score"] <= STRONG_SHORT_MAX].copy()
         if d.empty:
             st.info("No STRONG SHORT signals right now.")
         else:
-            st.dataframe(style_scores(d), use_container_width=True, height=650)
+            st.dataframe(d, use_container_width=True, height=650)
 
     with tab_watch:
         d = df_show[(df_show["Score"] < STRONG_LONG_MIN) & (df_show["Score"] > STRONG_SHORT_MAX)].copy()
-        st.dataframe(style_scores(d), use_container_width=True, height=650)
+        st.dataframe(d, use_container_width=True, height=650)
 
     with tab_all:
-        st.dataframe(style_scores(df_show), use_container_width=True, height=650)
+        st.dataframe(df_show, use_container_width=True, height=650)
+
 else:
-    st.info("Click **🚀 Scan Top 100** (or enable **Auto Scan**) to generate signals.")
+    st.info("İlk açılış taraması yapılıyor… (tablo birazdan dolacak)")
