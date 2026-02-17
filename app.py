@@ -19,8 +19,8 @@ def telegram_yolla(mesaj):
 
 exchange = ccxt.kucoin({'enableRateLimit': True})
 
-st.set_page_config(page_title="Alpha Sniper Balanced", layout="wide")
-st.title("🛡️ ALPHA SNIPER V42: BALANCED ELITE")
+st.set_page_config(page_title="Alpha Sniper Dual", layout="wide")
+st.title("🛡️ ALPHA SNIPER V42: LONG & SHORT")
 
 if 'bot_active' not in st.session_state:
     st.session_state.bot_active = False
@@ -29,14 +29,13 @@ c1, c2 = st.columns(2)
 with c1:
     if st.button("🚀 SİSTEMİ BAŞLAT"):
         st.session_state.bot_active = True
-        telegram_yolla("✅ *Sistem Dengeli Modda Başlatıldı!* \n- 100 Puan: *Anlık Bildirim*\n- Piyasa Özeti: *20 Dakikada Bir*")
+        telegram_yolla("✅ *Sniper Çift Yönlü Modda Başladı!* \n🟢 Long ve 🔴 Short takibi aktif.")
 
 with c2:
     if st.button("🛑 SİSTEMİ DURDUR"):
         st.session_state.bot_active = False
         telegram_yolla("⚠️ *Sistem Kapatıldı!*")
 
-# Takip Listesi
 symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'AVAX/USDT', 'FET/USDT', 'SUI/USDT', 'NEAR/USDT', 'RNDR/USDT', 'TIA/USDT', 'ARB/USDT', 'OP/USDT', 'LINK/USDT', 'DOT/USDT']
 
 placeholder = st.empty()
@@ -53,7 +52,7 @@ if st.session_state.bot_active:
                 bars = exchange.fetch_ohlcv(s, timeframe='1h', limit=200)
                 df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
                 
-                # --- DENGELİ TEKNİK ANALİZ ---
+                # --- TEKNİK ANALİZ ---
                 df['EMA200'] = ta.ema(df['c'], length=200)
                 df['RSI'] = ta.rsi(df['c'], length=14)
                 stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
@@ -64,26 +63,30 @@ if st.session_state.bot_active:
                 sd = [col for col in df.columns if 'STOCHRSId' in col][0]
                 
                 skor = 0
-                # 1. Trend (30 Puan): Fiyat EMA200 üzerinde mi?
-                if l['c'] > l['EMA200']: 
+                yon = "NÖTR"
+
+                # 🟢 LONG ŞARTLARI (Fiyat EMA200 Üstünde)
+                if l['c'] > l['EMA200']:
                     skor += 30
-                
-                # 2. Stoch RSI (40 Puan): 40 seviyesinin altında yukarı kesişim?
-                if p[sk] < p[sd] and l[sk] > l[sd] and l[sk] < 40: 
-                    skor += 40
-                
-                # 3. Hacim (20 Puan): Son mum hacmi ortalamanın üzerinde mi?
-                if l['v'] > df['v'].tail(15).mean(): 
-                    skor += 20
-                
-                # 4. RSI (10 Puan): RSI sağlıklı bölgede mi?
-                if 35 <= l['RSI'] <= 65: 
-                    skor += 10
-                
-                results.append({"COIN": s.replace('/USDT',''), "SKOR": skor, "FİYAT": l['c'], "RSI": int(l['RSI'])})
+                    if p[sk] < p[sd] and l[sk] > l[sd] and l[sk] < 40: # Dip dönüşü
+                        skor += 50
+                    if l['v'] > df['v'].tail(15).mean(): # Hacim
+                        skor += 20
+                    yon = "🟢 LONG"
+
+                # 🔴 SHORT ŞARTLARI (Fiyat EMA200 Altında)
+                elif l['c'] < l['EMA200']:
+                    skor += 30
+                    if p[sk] > p[sd] and l[sk] < l[sd] and l[sk] > 60: # Tepe dönüşü
+                        skor += 50
+                    if l['v'] > df['v'].tail(15).mean(): # Hacim
+                        skor += 20
+                    yon = "🔴 SHORT"
+
+                results.append({"COIN": s.replace('/USDT',''), "YÖN": yon, "SKOR": skor, "FİYAT": l['c']})
                 
                 if skor >= 100:
-                    telegram_yolla(f"🎯 *SİNYAL: 100 PUAN!* 🎯\n\n*Coin:* {s}\n*Fiyat:* {l['c']}\n*Skor:* 100/100\n_Filtrelerden başarıyla geçti!_")
+                    telegram_yolla(f"🚨 *SİNYAL ÇAKTI!* 🚨\n\n*YÖN:* {yon}\n*Coin:* {s}\n*Fiyat:* {l['c']}\n*Skor:* 100/100")
             except:
                 continue
         
@@ -95,10 +98,10 @@ if st.session_state.bot_active:
         
         # 20 Dakikalık Rapor
         if (current_time - last_report_time) >= 1200:
-            rapor = "📋 *Piyasa Özeti*\n"
+            rapor = "📋 *Gözcü Raporu (L/S)*\n"
             for _, row in final_df.head(10).iterrows():
-                emoji = "🟢" if row['SKOR'] >= 70 else "🟡" if row['SKOR'] >= 30 else "⚪"
-                rapor += f"{emoji} *{row['COIN']}*: {row['SKOR']} Puan | F: {row['FİYAT']}\n"
+                emoji = "🟩" if "LONG" in row['YÖN'] else "🟥"
+                rapor += f"{emoji} *{row['COIN']}*: {row['SKOR']} Puan | {row['YÖN']}\n"
             telegram_yolla(rapor)
             last_report_time = current_time
         
