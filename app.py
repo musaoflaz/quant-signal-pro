@@ -5,7 +5,7 @@ import pandas_ta as ta
 import time
 import requests
 
-# --- SENİN BİLGİLERİN SİSTEME GÖMÜLDÜ ---
+# --- AYARLAR ---
 TOKEN = "8330775219:AAHMGpdCdCEStj-B4Y3_WHD7xPEbjeaHWFM"
 CHAT_ID = "1358384022"
 
@@ -13,89 +13,78 @@ def telegram_yolla(mesaj):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": CHAT_ID, "text": mesaj}, timeout=10)
-    except Exception as e:
-        st.error(f"Telegram Hatası: {e}")
+    except:
+        pass
 
-# Borsa Bağlantısı (Kucoin/Binance Verisi)
 exchange = ccxt.kucoin({'enableRateLimit': True})
 
-st.set_page_config(page_title="Alpha Sniper V42", layout="wide")
-st.title("🛡️ ALPHA SNIPER V42")
-st.subheader("Otomatik Piyasa Gözcüsü")
+st.set_page_config(page_title="Alpha Sniper PRO", layout="wide")
+st.title("🛡️ ALPHA SNIPER PRO: ÇOKLU TARAMA")
 
-# Bot Durum Yönetimi
-if 'bot_calisiyor' not in st.session_state:
-    st.session_state.bot_calisiyor = False
+# GENİŞLETİLMİŞ COİN LİSTESİ
+symbols = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'LTC/USDT', 'AVAX/USDT', 'FET/USDT', 'SUI/USDT', 'NEAR/USDT',
+    'RNDR/USDT', 'ARB/USDT', 'OP/USDT', 'LINK/USDT', 'DOT/USDT', 'MATIC/USDT', 'TIA/USDT', 'APT/USDT',
+    'STX/USDT', 'INJ/USDT', 'FIL/USDT', 'ATOM/USDT', 'ALGO/USDT', 'XRP/USDT', 'ADA/USDT', 'DOGE/USDT'
+]
 
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("🟢 SİSTEMİ BAŞLAT"):
-        st.session_state.bot_calisiyor = True
-        telegram_yolla("🚀 Sniper Bot Aktif! 100 Puanlık 'Altın Sinyal' Bekleniyor...")
-        st.success("Bağlantı Kuruldu! Telegram'ı kontrol et.")
+if 'status' not in st.session_state:
+    st.session_state.status = False
 
-with col2:
-    if st.button("🔴 SİSTEMİ DURDUR"):
-        st.session_state.bot_calisiyor = False
-        st.warning("Sistem Durduruldu.")
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("🟢 TARAMAYI BAŞLAT"):
+        st.session_state.status = True
+        telegram_yolla("🚀 Pro Tarayıcı Aktif! Geniş liste taranıyor...")
+with c2:
+    if st.button("🔴 DURDUR"):
+        st.session_state.status = False
 
-# Ana Tarama Fonksiyonu
-def tarama_baslat():
-    # Binance 3x popüler coinler
-    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'LTC/USDT', 'AVAX/USDT', 'FET/USDT', 'SUI/USDT', 'NEAR/USDT']
-    
-    for s in symbols:
-        try:
-            # Veri çekme
-            bars = exchange.fetch_ohlcv(s, timeframe='1h', limit=150)
-            df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
-            
-            # Teknik Analiz (EMA + RSI + STOCH RSI)
-            df['EMA200'] = ta.ema(df['c'], length=200) or df['c'].rolling(100).mean()
-            df['RSI'] = ta.rsi(df['c'], length=14)
-            stoch = ta.stochrsi(df['c'], length=14, rsi_length=14, k=3, d=3)
-            df = pd.concat([df, stoch], axis=1)
-            
-            l = df.iloc[-1]  # Son mum
-            p = df.iloc[-2]  # Önceki mum
-            
-            # Kolon isimlerini otomatik bul (Hata almamak için)
-            sk = [c for c in df.columns if 'STOCHRSIk' in c][0]
-            sd = [c for c in df.columns if 'STOCHRSId' in c][0]
-            
-            # 🎯 100 PUANLIK SÜPER SİNYAL STRATEJİSİ
-            # 1. Şart: Fiyat EMA200 üzerinde (Yükselen Trend)
-            # 2. Şart: Stoch RSI altta yukarı kesişim (Altın Kesişim)
-            # 3. Şart: RSI aşırı şişmemiş (40-65 arası)
-            
-            skor = 0
-            if l['c'] > l['EMA200']:
-                skor += 40
-                if p[sk] < p[sd] and l[sk] > l[sd]:
-                    skor += 40
-                if 40 <= l['RSI'] <= 65:
-                    skor += 20
-            
-            if skor >= 100:
-                mesaj = (f"🎯 **100 PUANLIK SİNYAL!**\n\n"
-                         f"Coin: {s}\n"
-                         f"Fiyat: {l['c']}\n"
-                         f"RSI: {int(l['RSI'])}\n"
-                         f"Durum: EMA Üstü + Stoch Kesişimi\n\n"
-                         f"🚀 Binance 3x Hazır Ol!")
-                telegram_yolla(mesaj)
-                st.info(f"✅ Sinyal Gönderildi: {s}")
-            
-            time.sleep(0.1)
-        except:
-            continue
+# Tablo için boş alan
+table_placeholder = st.empty()
 
-# Döngü
-if st.session_state.bot_calisiyor:
-    placeholder = st.empty()
-    while st.session_state.bot_calisiyor:
-        with placeholder.container():
-            st.write(f"🔄 Tarama yapılıyor... Son Güncelleme: {time.strftime('%H:%M:%S')}")
-            tarama_baslat()
-            st.write("😴 5 dakika mola. Pusuya devam...")
-            time.sleep(300)
+if st.session_state.status:
+    while st.session_state.status:
+        results = []
+        for s in symbols:
+            try:
+                bars = exchange.fetch_ohlcv(s, timeframe='1h', limit=100)
+                df = pd.DataFrame(bars, columns=['t','o','h','l','c','v'])
+                
+                # Göstergeler
+                df['EMA200'] = ta.ema(df['c'], length=200) or df['c'].rolling(50).mean()
+                df['RSI'] = ta.rsi(df['c'], length=14)
+                stoch = ta.stochrsi(df['c'])
+                df = pd.concat([df, stoch], axis=1)
+                
+                l, p = df.iloc[-1], df.iloc[-2]
+                sk = [c for c in df.columns if 'STOCHRSIk' in c][0]
+                sd = [c for c in df.columns if 'STOCHRSId' in c][0]
+                
+                # Puanlama
+                puan = 0
+                if l['c'] > l['EMA200']: puan += 40
+                if p[sk] < p[sd] and l[sk] > l[sd]: puan += 40
+                if 40 <= l['RSI'] <= 70: puan += 20
+                
+                results.append({
+                    "Coin": s,
+                    "Fiyat": round(l['c'], 4),
+                    "RSI": round(l['RSI'], 2),
+                    "Puan": puan,
+                    "Trend": "📈 YUKARI" if l['c'] > l['EMA200'] else "📉 AŞAĞI"
+                })
+                
+                if puan >= 100:
+                    telegram_yolla(f"🎯 100 PUAN SİNYALİ!\nCoin: {s}\nFiyat: {round(l['c'], 4)}\nTrend: EMA Üstü\nStoch: Kesişim Var!")
+                
+            except:
+                continue
+        
+        # Tabloyu Güncelle
+        df_res = pd.DataFrame(results)
+        with table_placeholder.container():
+            st.write(f"⏱️ Son Güncelleme: {time.strftime('%H:%M:%S')}")
+            st.table(df_res.sort_values(by="Puan", ascending=False))
+        
+        time.sleep(60) # Geniş tarama olduğu için 1 dakikada bir yeniler
