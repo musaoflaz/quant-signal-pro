@@ -7,3 +7,5 @@ ta
 requests
 schedule
 pytz
+numba
+llvmlite
