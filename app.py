@@ -17,106 +17,47 @@ IST = ZoneInfo("Europe/Istanbul")
 
 TIMEFRAME = "15m"
 CANDLE_LIMIT = 220
+AUTO_REFRESH_SEC = 240
 
-AUTO_REFRESH_SEC = 240          # sayfa kaç sn'de bir yenilensin
-TABLE_ROWS = 20                 # tabloda kaç satır görünsün
-STRONG_SCORE = 90               # STRONG eşiği
-MIN_QV_USDT_24H = 0             # 0 bırak: "tüm coinler" (istersen 5000 gibi filtre koyarsın)
-MAX_SYMBOLS = None              # None = tüm USDT spot evreni (yavaş olabilir)
+TABLE_SIZE = 20
 
-# Skor adımı: 5'er 5'er
+# ✅ İSTEDİĞİN: STRONG 90+
+STRONG_MIN_SCORE = 90
+
+# Skor adımı: 5'er 5'er (100 yağmurunu azaltır)
 SCORE_STEP = 5
 
-# İndikatör parametreleri
-RSI_PERIOD = 14
-BB_PERIOD = 20
-BB_STD = 2.0
-EMA_FAST = 12
-EMA_SLOW = 26
-MACD_SIGNAL = 9
-ATR_PERIOD = 14
-VOL_Z_PERIOD = 20
-VWAP_PERIOD = 20
+# Evren çok büyük (900+). Cloud timeout yememek için likidite filtresi + cap
+MIN_QUOTE_VOL_24H = 10_000  # USDT
+MAX_SCAN_SYMBOLS = 450      # gerekirse yükseltiriz
 
-
-# =============================
-# YARDIMCI MATH
-# =============================
-def _clip(x, lo=0.0, hi=1.0):
-    return float(np.clip(x, lo, hi))
-
-
-def _sigmoid(x: float) -> float:
-    # stabil sigmoid
-    x = float(np.clip(x, -20, 20))
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def ema(s: pd.Series, period: int) -> pd.Series:
-    return s.ewm(span=period, adjust=False, min_periods=period).mean()
-
-
-def rsi_wilder(series: pd.Series, period: int) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi.fillna(50.0)
-
-
-def bollinger(series: pd.Series, period: int, n_std: float):
-    mid = series.rolling(period, min_periods=period).mean()
-    std = series.rolling(period, min_periods=period).std(ddof=0)
-    upper = mid + n_std * std
-    lower = mid - n_std * std
-    return mid, upper, lower
-
-
-def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    prev_close = close.shift(1)
-    tr1 = (high - low).abs()
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    tr = true_range(high, low, close)
-    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-
-
-def vwap_typical(df: pd.DataFrame, period: int) -> pd.Series:
-    # rolling VWAP (typical price)
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    vol = df["volume"].astype(float)
-    pv = tp * vol
-    pv_sum = pv.rolling(period, min_periods=period).sum()
-    vol_sum = vol.rolling(period, min_periods=period).sum().replace(0.0, np.nan)
-    return (pv_sum / vol_sum).fillna(method="bfill").fillna(method="ffill")
-
-
-def quantize_score(x: float, step: int = 5) -> int:
-    x = float(np.clip(x, 0, 100))
-    return int(round(x / step) * step)
+# Ağırlıklar (toplam ~100)
+W_RSI = 22
+W_BB = 22
+W_TREND = 18
+W_MACD = 14
+W_ADX = 10
+W_ATR = 8
+W_VOL = 6
 
 
 # =============================
 # KUCOIN / CCXT
 # =============================
 def make_exchange() -> ccxt.kucoin:
-    return ccxt.kucoin({"enableRateLimit": True, "timeout": 20000})
+    return ccxt.kucoin(
+        {
+            "enableRateLimit": True,
+            "timeout": 20000,
+        }
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=600)
 def load_usdt_spot_symbols() -> list[str]:
     ex = make_exchange()
     markets = ex.load_markets()
-    syms = []
+    out: list[str] = []
     for sym, m in markets.items():
         if not m:
             continue
@@ -126,9 +67,8 @@ def load_usdt_spot_symbols() -> list[str]:
             continue
         if m.get("quote") != "USDT":
             continue
-        syms.append(sym)
-    syms = sorted(set(syms))
-    return syms
+        out.append(sym)
+    return sorted(set(out))
 
 
 def safe_fetch_tickers(ex: ccxt.Exchange) -> dict:
@@ -138,403 +78,390 @@ def safe_fetch_tickers(ex: ccxt.Exchange) -> dict:
         return {}
 
 
-def qv_usdt_24h(t: dict) -> float:
-    # KuCoin tickers genelde quoteVolume verir
-    if not isinstance(t, dict):
+def safe_fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int):
+    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+
+def qv_24h(t: dict) -> float:
+    if not t or not isinstance(t, dict):
         return 0.0
     qv = t.get("quoteVolume")
     if qv is not None:
         try:
             return float(qv)
         except Exception:
-            pass
-    # fallback: baseVolume * last
+            return 0.0
+    bv = t.get("baseVolume")
+    last = t.get("last")
     try:
-        bv = float(t.get("baseVolume", 0.0))
-        last = float(t.get("last", 0.0))
-        return bv * last
-    except Exception:
-        return 0.0
-
-
-def spread_pct(t: dict) -> float:
-    # bid/ask varsa spread cezası için kullan
-    try:
-        bid = float(t.get("bid", 0.0))
-        ask = float(t.get("ask", 0.0))
-        last = float(t.get("last", 0.0))
-        if bid > 0 and ask > 0 and last > 0:
-            return (ask - bid) / last
+        if bv is not None and last is not None:
+            return float(bv) * float(last)
     except Exception:
         pass
     return 0.0
 
 
-def safe_fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int):
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+# =============================
+# İNDİKATÖRLER (PURE pandas/numpy)
+# =============================
+def sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n, min_periods=n).mean()
+
+
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False, min_periods=n).mean()
+
+
+def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
+
+
+def bollinger(close: pd.Series, n: int = 20, k: float = 2.0):
+    mid = sma(close, n)
+    std = close.rolling(n, min_periods=n).std(ddof=0)
+    up = mid + k * std
+    low = mid - k * std
+    return mid, up, low
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, sig: int = 9):
+    ef = ema(close, fast)
+    es = ema(close, slow)
+    line = ef - es
+    signal = ema(line, sig)
+    hist = line - signal
+    return line, signal, hist
+
+
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
+    tr = true_range(high, low, close)
+    return tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
+    up = high.diff()
+    down = -low.diff()
+
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+    tr = true_range(high, low, close)
+    atr_n = tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
+
+    plus_di = 100 * pd.Series(plus_dm, index=high.index).ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean() / atr_n
+    minus_di = 100 * pd.Series(minus_dm, index=high.index).ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean() / atr_n
+
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    return dx.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean().fillna(0.0)
 
 
 # =============================
-# SKORLAMA (Daha “sert” + daha gerçekçi)
+# SKORLAMA (LONG/SHORT ayrı, sonra max)
 # =============================
-def score_one(df: pd.DataFrame, ticker: dict) -> tuple[str, int, int]:
+def clamp(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
+
+def quantize_score(x: float, step: int = 5) -> int:
+    # 0..100 arası, step'e yuvarla
+    x = clamp(x, 0, 100)
+    q = int(round(x / step) * step)
+    return int(clamp(q, 0, 100))
+
+
+def score_one(df: pd.DataFrame) -> tuple[int, int, str]:
     """
-    returns: (direction, score, raw_score)
-      - direction: LONG / SHORT
-      - score: quantized score (0..100 step=5)
-      - raw_score: before quantize (0..100 int)
+    returns: (score_quantized, raw_best, direction)
     """
     close = df["close"].astype(float)
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     vol = df["volume"].astype(float)
 
-    # indicators
-    rsi14 = rsi_wilder(close, RSI_PERIOD)
-    _, bb_up, bb_low = bollinger(close, BB_PERIOD, BB_STD)
-    atr14 = atr(high, low, close, ATR_PERIOD)
+    if len(close) < 60:
+        return 0, 0, "—"
 
-    ema_f = ema(close, EMA_FAST)
-    ema_s = ema(close, EMA_SLOW)
+    rsi = rsi_wilder(close, 14).iloc[-1]
+    mid, up, low_bb = bollinger(close, 20, 2.0)
+    sma20 = sma(close, 20)
+    macd_line, macd_sig, macd_hist = macd(close)
+    adx_v = adx(high, low, close, 14).iloc[-1]
+    atr_v = atr(high, low, close, 14).iloc[-1]
 
-    macd_line = ema_f - ema_s
-    macd_signal = macd_line.ewm(span=MACD_SIGNAL, adjust=False, min_periods=MACD_SIGNAL).mean()
-    macd_hist = macd_line - macd_signal
-
-    vwap20 = vwap_typical(df, VWAP_PERIOD)
-
-    # last values
     last = float(close.iloc[-1])
-    last_atr = float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else 0.0
-    last_rsi = float(rsi14.iloc[-1])
-    last_bb_up = float(bb_up.iloc[-1])
-    last_bb_low = float(bb_low.iloc[-1])
-    last_vwap = float(vwap20.iloc[-1])
+    prev = float(close.iloc[-2])
+    last_sma = float(sma20.iloc[-1])
+    prev_sma = float(sma20.iloc[-2])
 
-    if last_atr <= 0 or np.isnan([last_bb_up, last_bb_low, last_vwap]).any():
-        return "—", 0, 0
+    bb_up = float(up.iloc[-1])
+    bb_low = float(low_bb.iloc[-1])
+    bb_range = max(1e-9, (bb_up - bb_low))
+    bb_pos = (last - bb_low) / bb_range  # 0..1
 
-    # bb position (0 low .. 1 high)
-    denom = max(1e-12, (last_bb_up - last_bb_low))
-    bbp = (last - last_bb_low) / denom
-    bbp = float(np.clip(bbp, 0.0, 1.0))
+    hist = float(macd_hist.iloc[-1])
 
-    # trend & momentum normalized by ATR
-    trend_norm = float((ema_f.iloc[-1] - ema_s.iloc[-1]) / last_atr)
-    macd_norm = float(macd_hist.iloc[-1] / last_atr)
+    # ATR% (çok oynaksa kaldıraçta risk)
+    atr_pct = (atr_v / last) * 100.0 if last > 0 else 0.0
 
-    # volume z-score
-    v_mean = vol.rolling(VOL_Z_PERIOD, min_periods=VOL_Z_PERIOD).mean().iloc[-1]
-    v_std = vol.rolling(VOL_Z_PERIOD, min_periods=VOL_Z_PERIOD).std(ddof=0).iloc[-1]
-    vol_z = 0.0
-    if pd.notna(v_mean) and pd.notna(v_std) and float(v_std) > 0:
-        vol_z = float((vol.iloc[-1] - v_mean) / v_std)
+    # Volume spike (kırılım/ivme)
+    vol_sma = float(sma(vol, 20).iloc[-1]) if len(vol) >= 20 else float(vol.mean())
+    vol_ratio = (float(vol.iloc[-1]) / vol_sma) if vol_sma > 0 else 1.0
 
-    # vwap deviation
-    vwap_dev = (last - last_vwap) / max(1e-12, last_vwap)
+    # -------------- bileşen skorları --------------
+    long_raw = 0.0
+    short_raw = 0.0
 
-    # --- LONG components (0..1)
-    c_trend_L = _sigmoid(trend_norm * 1.2)                 # trend +
-    c_macd_L = _sigmoid(macd_norm * 1.4)                   # momentum +
-    # RSI: çok yüksek değil, orta + hafif oversold daha iyi
-    c_rsi_L = float(np.exp(-((last_rsi - 52.0) / 12.0) ** 2))
-    # pullback: alt banda yakınsa iyi (bbp küçük)
-    c_bb_L = 1.0 - bbp
-    c_bb_L = _clip(c_bb_L, 0, 1)
-    # VWAP: vwap altında/çevresinde iyi
-    c_vwap_L = _sigmoid((-vwap_dev) / 0.010)
-    # volume confirm
-    c_vol = _sigmoid((vol_z - 0.2) * 1.0)
+    # RSI (low -> long, high -> short)
+    # 25 altı çok güçlü long, 75 üstü çok güçlü short
+    long_raw += W_RSI * clamp((50.0 - rsi) / 25.0, 0.0, 1.0)
+    short_raw += W_RSI * clamp((rsi - 50.0) / 25.0, 0.0, 1.0)
 
-    long_raw = (
-        0.22 * c_trend_L
-        + 0.18 * c_macd_L
-        + 0.18 * c_rsi_L
-        + 0.18 * c_bb_L
-        + 0.14 * c_vwap_L
-        + 0.10 * c_vol
-    ) * 100.0
+    # Bollinger (alt banda yakın -> long, üst banda yakın -> short)
+    long_raw += W_BB * clamp((0.35 - bb_pos) / 0.35, 0.0, 1.0)
+    short_raw += W_BB * clamp((bb_pos - 0.65) / 0.35, 0.0, 1.0)
 
-    # --- SHORT components (0..1)
-    c_trend_S = _sigmoid((-trend_norm) * 1.2)              # trend -
-    c_macd_S = _sigmoid((-macd_norm) * 1.4)                # momentum -
-    c_rsi_S = float(np.exp(-((last_rsi - 48.0) / 12.0) ** 2))
-    # bounce: üst banda yakınsa iyi (bbp büyük)
-    c_bb_S = bbp
-    c_bb_S = _clip(c_bb_S, 0, 1)
-    # VWAP: vwap üstünde/çevresinde iyi
-    c_vwap_S = _sigmoid((vwap_dev) / 0.010)
-
-    short_raw = (
-        0.22 * c_trend_S
-        + 0.18 * c_macd_S
-        + 0.18 * c_rsi_S
-        + 0.18 * c_bb_S
-        + 0.14 * c_vwap_S
-        + 0.10 * c_vol
-    ) * 100.0
-
-    # direction
-    if long_raw >= short_raw:
-        direction = "LONG"
-        raw = float(long_raw)
+    # Trend (SMA20 üstü + SMA yükseliyor -> long, tersi -> short)
+    sma_slope = last_sma - prev_sma
+    if last > last_sma and sma_slope > 0:
+        long_raw += W_TREND
+    elif last < last_sma and sma_slope < 0:
+        short_raw += W_TREND
     else:
+        # trend net değilse düşük puan
+        if last > last_sma:
+            long_raw += W_TREND * 0.35
+        elif last < last_sma:
+            short_raw += W_TREND * 0.35
+
+    # MACD hist (pozitif -> long, negatif -> short)
+    # hist büyüklüğünü normalize et
+    hist_norm = clamp(abs(hist) / (abs(last) * 0.002 + 1e-9), 0.0, 1.0)
+    if hist > 0:
+        long_raw += W_MACD * hist_norm
+    elif hist < 0:
+        short_raw += W_MACD * hist_norm
+
+    # ADX (trend güç filtresi): adx düşükse ikisini de kırp
+    # 18 altı zayıf, 25 üstü iyi
+    adx_mult = 0.65 + 0.35 * clamp((adx_v - 18.0) / 12.0, 0.0, 1.0)
+    # ayrıca ADX bileşen puanı da ekleyelim (trend varsa)
+    adx_bonus = W_ADX * clamp((adx_v - 18.0) / 18.0, 0.0, 1.0)
+    long_raw += adx_bonus * (1.0 if last > last_sma else 0.4)
+    short_raw += adx_bonus * (1.0 if last < last_sma else 0.4)
+
+    # ATR% (aşırı oynaksa ceza)
+    # 1-4% ideal, 6% üstü risk -> puanı kır
+    if atr_pct <= 4.0:
+        atr_mult = 1.0
+    elif atr_pct >= 8.0:
+        atr_mult = 0.75
+    else:
+        # 4..8 lineer düş
+        atr_mult = 1.0 - (atr_pct - 4.0) * (0.25 / 4.0)
+    # ATR bileşeni: düşük-orta volatiliteye küçük bonus
+    atr_bonus = W_ATR * clamp((4.0 - atr_pct) / 4.0, 0.0, 1.0)
+    long_raw += atr_bonus * 0.6
+    short_raw += atr_bonus * 0.6
+
+    # Volume spike: trend yönüyle uyumluysa bonus
+    vol_boost = W_VOL * clamp((vol_ratio - 1.2) / 1.0, 0.0, 1.0)
+    if last > last_sma:
+        long_raw += vol_boost
+    elif last < last_sma:
+        short_raw += vol_boost
+
+    # -------------- multipliers --------------
+    long_raw *= adx_mult * atr_mult
+    short_raw *= adx_mult * atr_mult
+
+    # -------------- final --------------
+    # 0..100'e normalize et (ağırlık toplamına göre)
+    weight_sum = float(W_RSI + W_BB + W_TREND + W_MACD + W_ADX + W_ATR + W_VOL)
+    long_score = (long_raw / weight_sum) * 100.0
+    short_score = (short_raw / weight_sum) * 100.0
+
+    if long_score >= short_score:
+        raw_best = int(round(clamp(long_score, 0, 100)))
+        score_q = quantize_score(long_score, SCORE_STEP)
+        direction = "LONG"
+    else:
+        raw_best = int(round(clamp(short_score, 0, 100)))
+        score_q = quantize_score(short_score, SCORE_STEP)
         direction = "SHORT"
-        raw = float(short_raw)
 
-    # --- Liquidity / Spread penalties (100'leri azaltan ana şey)
-    qv = qv_usdt_24h(ticker)
-    sp = spread_pct(ticker)
-
-    # likidite faktörü: 0..1 (çok küçük hacimde skor kırılır)
-    # 1e4=10k -> düşük, 1e6=1M -> iyi, 1e7=10M -> çok iyi
-    liq = _clip(np.log10(qv + 1.0) / 7.0, 0.0, 1.0)  # 10^7 ~ 1.0
-    liq_factor = 0.55 + 0.45 * liq                   # min 0.55
-
-    # spread cezası: %0.5 spread bile kaldıraçta kötü
-    # sp=0.001 (0.1%) -> hafif kır, sp=0.005 (0.5%) -> çok kır
-    spread_factor = _clip(1.0 - (sp * 120.0), 0.40, 1.0)
-
-    raw = raw * liq_factor * spread_factor
-
-    # hard cap + quantize
-    raw = float(np.clip(raw, 0, 100))
-    score = quantize_score(raw, SCORE_STEP)
-
-    return direction, score, int(round(raw))
+    return score_q, raw_best, direction
 
 
 # =============================
-# TABLO SEÇİMİ (STRONG + TOP fill)
+# UI (Koyu tema fix + loader)
 # =============================
-def build_table(df_all: pd.DataFrame) -> pd.DataFrame:
-    if df_all.empty:
-        return df_all
-
-    df_all = df_all.sort_values(["SKOR", "QV_24H"], ascending=[False, False]).reset_index(drop=True)
-
-    strong = df_all[df_all["SKOR"] >= STRONG_SCORE].copy()
-    strong = strong.sort_values(["SKOR", "QV_24H"], ascending=[False, False]).reset_index(drop=True)
-
-    if len(strong) >= TABLE_ROWS:
-        return strong.head(TABLE_ROWS).reset_index(drop=True)
-
-    picked = strong.copy()
-    remain = df_all[~df_all["COIN"].isin(picked["COIN"])].copy()
-    remain = remain.sort_values(["SKOR", "QV_24H"], ascending=[False, False]).reset_index(drop=True)
-
-    need = TABLE_ROWS - len(picked)
-    if need > 0 and not remain.empty:
-        picked = pd.concat([picked, remain.head(need)], ignore_index=True)
-
-    # SHORT görünmeme problemini engelle: imkan varsa min 3 SHORT ve min 3 LONG
-    total_shorts = int((df_all["YÖN"] == "SHORT").sum())
-    total_longs = int((df_all["YÖN"] == "LONG").sum())
-
-    def enforce_min(direction: str, min_n: int):
-        nonlocal picked
-        cur = int((picked["YÖN"] == direction).sum())
-        if cur >= min_n:
-            return
-        if direction == "SHORT" and total_shorts < min_n:
-            return
-        if direction == "LONG" and total_longs < min_n:
-            return
-
-        # eksik kadar en iyi adayları al
-        missing = min_n - cur
-        candidates = df_all[(df_all["YÖN"] == direction) & (~df_all["COIN"].isin(picked["COIN"]))].copy()
-        if candidates.empty:
-            return
-        add = candidates.sort_values(["SKOR", "QV_24H"], ascending=[False, False]).head(missing).copy()
-
-        # karşı yönden en düşük skorları çıkarıp yerine koy
-        opp = "LONG" if direction == "SHORT" else "SHORT"
-        drop_idx = picked[picked["YÖN"] == opp].sort_values(["SKOR", "QV_24H"], ascending=[True, True]).head(len(add)).index
-        picked = picked.drop(index=drop_idx).reset_index(drop=True)
-        picked = pd.concat([picked, add], ignore_index=True)
-
-    enforce_min("SHORT", 3)
-    enforce_min("LONG", 3)
-
-    picked = picked.sort_values(["SKOR", "QV_24H"], ascending=[False, False]).head(TABLE_ROWS).reset_index(drop=True)
-    return picked
-
-
-# =============================
-# UI (Dark + Auto)
-# =============================
-st.set_page_config(page_title="KuCoin PRO Sniper — Auto (LONG + SHORT)", layout="wide")
+st.set_page_config(page_title="KuCoin PRO Sniper — Auto (LONG+SHORT)", layout="wide")
 
 st.markdown(
     """
 <style>
+/* Koyu tema sabit */
 html, body, [class*="css"]  { background-color: #0b0f14 !important; }
-.block-container { padding-top: 1.1rem; padding-bottom: 2.0rem; }
-h1,h2,h3,h4,h5,h6,p,span,div { color: #e6edf3; }
-[data-testid="stHeader"] { background: rgba(0,0,0,0); }
-[data-testid="stToolbar"] { display: none; }
+.block-container { padding-top: 1.0rem; padding-bottom: 2rem; }
+h1,h2,h3,h4,p,span,div { color: #e6edf3 !important; }
+[data-testid="stHeader"] { background: rgba(0,0,0,0) !important; }
+[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
 
-.small-muted { opacity: 0.85; font-size: 13px; }
-.badge { padding: 10px 12px; border-radius: 10px; border: 1px solid #1f2a37; }
-.badge-ok { background: rgba(16, 185, 129, 0.12); }
-.badge-warn { background: rgba(245, 158, 11, 0.12); }
-.badge-bad { background: rgba(239, 68, 68, 0.12); }
-
+/* Tablo yazıları daha net */
+thead tr th { color: #e6edf3 !important; background: #0f172a !important; }
+tbody tr td { color: #e6edf3 !important; background: #0b0f14 !important; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# Auto refresh (tıklama yok)
-try:
-    st.autorefresh(interval=AUTO_REFRESH_SEC * 1000, key="auto_refresh")
-except Exception:
+# Auto refresh
+def try_autorefresh(interval_ms: int, key: str):
     try:
-        st.experimental_autorefresh(interval=AUTO_REFRESH_SEC * 1000, key="auto_refresh")
+        return st.autorefresh(interval=interval_ms, key=key)
     except Exception:
-        pass
+        try:
+            return st.experimental_autorefresh(interval=interval_ms, key=key)
+        except Exception:
+            return None
 
-left, right = st.columns([2, 1], vertical_alignment="center")
-with left:
-    st.title("🎯 KuCoin PRO Sniper — Auto (LONG + SHORT)")
-    st.caption(
-        f"TF={TIMEFRAME} • STRONG: SKOR≥{STRONG_SCORE} • Tablo: önce STRONG, sonra TOP ile dolar • Skor adımı: {SCORE_STEP}"
-    )
-with right:
-    now_ist = datetime.now(IST)
-    st.markdown(
-        f"""
-<div style="text-align:right; padding-top: 10px;">
-  <div class="small-muted">Istanbul Time</div>
-  <div style="font-size: 18px; font-weight: 800;">{now_ist.strftime('%Y-%m-%d %H:%M:%S')}</div>
+try_autorefresh(interval_ms=int(AUTO_REFRESH_SEC * 1000), key="auto_refresh")
+
+
+# Başlık
+now_ist = datetime.now(IST)
+st.title("KuCoin PRO Sniper — Auto (LONG + SHORT)")
+st.caption(
+    f"TF={TIMEFRAME} • STRONG: SKOR≥{STRONG_MIN_SCORE} • Tablo: önce STRONG, boş kalırsa TOP ile dolar • Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s"
+)
+st.markdown(
+    f"""
+<div style="text-align:right; margin-top:-40px;">
+  <div style="font-size:12px; opacity:0.85;">Istanbul Time</div>
+  <div style="font-size:18px; font-weight:800;">{now_ist.strftime('%Y-%m-%d %H:%M:%S')}</div>
 </div>
 """,
-        unsafe_allow_html=True,
-    )
+    unsafe_allow_html=True,
+)
 
-status_box = st.empty()
-progress_box = st.empty()
 
-# ================
-# RUN SCAN
-# ================
+# =============================
+# TARMA
+# =============================
 ex = make_exchange()
 
-with st.spinner("⏳ KuCoin USDT spot evreni taranıyor… (lütfen bekle)"):
+with st.spinner("⏳ KuCoin USDT spot evreni taranıyor..."):
     syms = load_usdt_spot_symbols()
     tickers = safe_fetch_tickers(ex)
 
-    # "tüm coinler" = tüm USDT spot pair; ama istersen MIN_QV ile çöp coinleri azaltırsın
-    candidates = []
-    for s in syms:
-        t = tickers.get(s, {})
-        qv = qv_usdt_24h(t)
-        if qv < MIN_QV_USDT_24H:
+# Likidite filtre + cap
+ranked = []
+for s in syms:
+    t = tickers.get(s)
+    qv = qv_24h(t)
+    if qv >= MIN_QUOTE_VOL_24H:
+        ranked.append((s, qv))
+
+ranked.sort(key=lambda x: x[1], reverse=True)
+scan_list = [s for s, _ in ranked[:MAX_SCAN_SYMBOLS]]
+
+st.info(f"Evren (USDT spot): {len(syms)} • Likidite filtresi sonrası: {len(ranked)} • Tarama: {len(scan_list)}", icon="🧠")
+
+progress = st.progress(0)
+status = st.empty()
+
+rows = []
+total = max(1, len(scan_list))
+
+for i, symbol in enumerate(scan_list, start=1):
+    if i == 1:
+        status.write("🔎 Mum verileri çekiliyor, skor hesaplanıyor...")
+
+    progress.progress(int((i / total) * 100))
+
+    try:
+        ohlcv = safe_fetch_ohlcv(ex, symbol, TIMEFRAME, CANDLE_LIMIT)
+        if not ohlcv or len(ohlcv) < 80:
             continue
-        candidates.append(s)
 
-    if MAX_SYMBOLS is not None:
-        candidates = candidates[: int(MAX_SYMBOLS)]
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        score_q, raw_best, direction = score_one(df)
 
-    total = len(candidates)
-    if total == 0:
-        status_box.error("Hiç USDT spot sembol bulunamadı (veya filtre çok sert).")
-        st.stop()
+        t = tickers.get(symbol, {})
+        last = t.get("last", None)
+        if last is None:
+            last = float(df["close"].iloc[-1])
+        else:
+            try:
+                last = float(last)
+            except Exception:
+                last = float(df["close"].iloc[-1])
 
-    progress = progress_box.progress(0, text=f"Başlıyor… (0/{total})")
-    rows = []
-    last_ok = 0
+        qv = qv_24h(t)
 
-    for i, symbol in enumerate(candidates, start=1):
-        if i == 1 or i % 15 == 0:
-            progress.progress(int((i - 1) / total * 100), text=f"Taranıyor: {symbol}  ({i}/{total})")
+        rows.append(
+            {
+                "YÖN": direction,
+                "COIN": symbol.replace("/USDT", ""),
+                "SKOR": int(score_q),
+                "FİYAT": float(last),
+                "RAW": int(raw_best),
+                "QV_24H": float(qv),
+            }
+        )
 
-        try:
-            ohlcv = safe_fetch_ohlcv(ex, symbol, TIMEFRAME, CANDLE_LIMIT)
-            if not ohlcv or len(ohlcv) < max(EMA_SLOW, BB_PERIOD, RSI_PERIOD, ATR_PERIOD, VOL_Z_PERIOD, VWAP_PERIOD) + 5:
-                continue
+    except (ccxt.RequestTimeout, ccxt.NetworkError):
+        continue
+    except Exception:
+        continue
 
-            df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-            t = tickers.get(symbol, {})
+    time.sleep(0.02)
 
-            direction, score, raw = score_one(df, t)
-            if direction == "—":
-                continue
+progress.empty()
+status.empty()
 
-            last_price = float(df["close"].iloc[-1])
-
-            rows.append(
-                {
-                    "YÖN": direction,
-                    "COIN": symbol.replace("/USDT", ""),
-                    "SKOR": int(score),
-                    "FİYAT": float(last_price),
-                    "RAW": int(raw),
-                    "QV_24H": int(round(qv_usdt_24h(t))),
-                }
-            )
-            last_ok += 1
-
-        except (ccxt.RequestTimeout, ccxt.NetworkError):
-            pass
-        except ccxt.ExchangeError:
-            pass
-        except Exception:
-            pass
-
-        time.sleep(0.03)  # rate limit dostu
-
-    progress.progress(100, text=f"Tamamlandı. Başarılı: {last_ok}/{total}")
-    time.sleep(0.2)
-    progress_box.empty()
-
-df_all = pd.DataFrame(rows)
-if df_all.empty:
-    status_box.markdown(
-        f"""<div class="badge badge-bad">❌ Veri gelmedi. KuCoin/network anlık sorun olabilir. Bir sonraki auto-refresh'te tekrar dene.</div>""",
-        unsafe_allow_html=True,
-    )
+out = pd.DataFrame(rows)
+if out.empty:
+    st.error("Sonuç yok. (KuCoin ağ / rate-limit olabilir) Bir sonraki auto refresh'i bekle.")
     st.stop()
 
-df_table = build_table(df_all)
+# STRONG öncelik, sonra TOP ile doldur
+strong_df = out[out["SKOR"] >= STRONG_MIN_SCORE].copy()
+rest_df = out[out["SKOR"] < STRONG_MIN_SCORE].copy()
 
-strong_count = int((df_table["SKOR"] >= STRONG_SCORE).sum())
-longs = int((df_table["YÖN"] == "LONG").sum())
-shorts = int((df_table["YÖN"] == "SHORT").sum())
+strong_df = strong_df.sort_values(["SKOR", "QV_24H"], ascending=[False, False])
+rest_df = rest_df.sort_values(["SKOR", "QV_24H"], ascending=[False, False])
 
-if strong_count > 0:
-    status_box.markdown(
-        f"""<div class="badge badge-ok">✅ STRONG bulundu. STRONG sayısı: <b>{strong_count}</b> • LONG/SHORT: <b>{longs}/{shorts}</b></div>""",
-        unsafe_allow_html=True,
-    )
+final = pd.concat([strong_df, rest_df], axis=0).drop_duplicates(subset=["COIN"]).head(TABLE_SIZE).reset_index(drop=True)
+
+if len(strong_df) > 0:
+    st.success(f"✅ STRONG bulundu. Önce STRONG gösteriliyor (SKOR≥{STRONG_MIN_SCORE}), boş kalırsa TOP ile doluyor.", icon="✅")
 else:
-    status_box.markdown(
-        f"""<div class="badge badge-warn">⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu • LONG/SHORT: <b>{longs}/{shorts}</b></div>""",
-        unsafe_allow_html=True,
-    )
+    st.warning(f"⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu.", icon="⚠️")
 
-st.write("")
-st.subheader("🎯 SNIPER TABLO")
-
-# =============================
-# STYLING (Dark table)
-# =============================
-def style_df(df: pd.DataFrame):
-    d = df.copy()
-
-    fmt = {
-        "FİYAT": "{:.6f}",
-        "QV_24H": "{:,}",
-        "SKOR": "{:d}",
-        "RAW": "{:d}",
-    }
-
+# Renklendirme (YÖN ve SKOR)
+def style_table(df: pd.DataFrame):
     def dir_style(v):
-        if v == "LONG":
-            return "background-color:#064e3b;color:#e6edf3;font-weight:800;"
-        if v == "SHORT":
-            return "background-color:#7f1d1d;color:#e6edf3;font-weight:800;"
+        if str(v) == "LONG":
+            return "background-color:#064e3b; color:#ffffff; font-weight:800;"
+        if str(v) == "SHORT":
+            return "background-color:#7f1d1d; color:#ffffff; font-weight:800;"
         return ""
 
     def score_style(v):
@@ -542,29 +469,29 @@ def style_df(df: pd.DataFrame):
             v = int(v)
         except Exception:
             return ""
-        if v >= STRONG_SCORE:
-            return "background-color:#065f46;color:#ffffff;font-weight:900;"
-        if v >= 80:
-            return "background-color:#0f766e;color:#ffffff;font-weight:800;"
-        if v >= 70:
-            return "background-color:#1f2937;color:#e6edf3;"
-        return "background-color:#111827;color:#e6edf3;"
+        if v >= STRONG_MIN_SCORE:
+            return "background-color:#065f46; color:#ffffff; font-weight:900;"
+        if v >= 75:
+            return "background-color:#14532d; color:#ffffff; font-weight:800;"
+        if v <= 35:
+            return "background-color:#7f1d1d; color:#ffffff; font-weight:800;"
+        return ""
+
+    fmt = {
+        "FİYAT": "{:.6f}",
+        "QV_24H": "{:,.0f}",
+    }
 
     return (
-        d.style.format(fmt)
+        df.style.format(fmt)
         .applymap(dir_style, subset=["YÖN"])
         .applymap(score_style, subset=["SKOR"])
-        .set_table_styles(
-            [
-                {"selector": "th", "props": [("background-color", "#0f172a"), ("color", "#e6edf3"), ("border-color", "#1f2a37")]},
-                {"selector": "td", "props": [("background-color", "#0b0f14"), ("color", "#e6edf3"), ("border-color", "#1f2a37")]},
-                {"selector": "table", "props": [("border-collapse", "collapse"), ("border", "1px solid #1f2a37")]},
-            ]
-        )
+        .set_properties(**{"border-color": "#1f2a37"})
     )
 
-# gösterilecek kolon sırası
-show_cols = ["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H"]
-df_show = df_table.loc[:, show_cols].copy()
+st.subheader("🎯 SNIPER TABLO")
+st.dataframe(style_table(final), use_container_width=True, height=720)
 
-st.dataframe(style_df(df_show), height=750)
+st.caption(
+    "Not: Bu sürüm ‘menüsüz’ ve otomatik. İstersen bir sonraki adımda MAX_SCAN_SYMBOLS/likidite filtresini ayarlanabilir yaparız (ama sen istemediğin için şimdilik sabit)."
+)
