@@ -4,7 +4,6 @@
 # Not: pandas_ta KULLANMIYOR (requirements derdi çıkmasın)
 
 import time
-import math
 import requests
 import numpy as np
 import pandas as pd
@@ -129,7 +128,6 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    # Basit ADX (Wilder tarzı yaklaşıma yakın)
     up_move = high.diff()
     down_move = -low.diff()
 
@@ -137,8 +135,8 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
     tr = true_range(high, low, close)
-
     atr_s = tr.ewm(alpha=1/period, adjust=False).mean()
+
     plus_di = 100 * pd.Series(plus_dm, index=high.index).ewm(alpha=1/period, adjust=False).mean() / (atr_s.replace(0, np.nan))
     minus_di = 100 * pd.Series(minus_dm, index=high.index).ewm(alpha=1/period, adjust=False).mean() / (atr_s.replace(0, np.nan))
 
@@ -172,12 +170,10 @@ def fetch_all_tickers():
     r.raise_for_status()
     data = r.json()["data"]["ticker"]
     df = pd.DataFrame(data)
-    # beklenen kolonlar: symbolName, symbol, buy, sell, changeRate, vol, volValue, last
     return df
 
 @st.cache_data(ttl=REFRESH_SEC, show_spinner=False)
 def fetch_candles(symbol: str, tf: str = TF, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
-    # KuCoin candles: [time, open, close, high, low, volume, turnover]
     url = f"{KUCOIN}/api/v1/market/candles"
     params = {"type": tf, "symbol": symbol}
     r = requests.get(url, params=params, timeout=20)
@@ -187,30 +183,24 @@ def fetch_candles(symbol: str, tf: str = TF, limit: int = CANDLE_LIMIT) -> pd.Da
         return pd.DataFrame()
     arr = arr[:limit]
     df = pd.DataFrame(arr, columns=["time", "open", "close", "high", "low", "volume", "turnover"])
-    # time unix seconds string
     df["time"] = pd.to_datetime(df["time"].astype(int), unit="s", utc=True)
     for c in ["open", "close", "high", "low", "volume", "turnover"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.sort_values("time")
-    df = df.dropna()
-    return df.reset_index(drop=True)
+    df = df.sort_values("time").dropna().reset_index(drop=True)
+    return df
 
 def is_usdt_spot(symbol_name: str) -> bool:
     return isinstance(symbol_name, str) and symbol_name.endswith("-USDT")
 
 def is_junk(symbol_name: str) -> bool:
-    # çok kaba filtre: leveraged / 3L 3S / UP DOWN vb.
     s = symbol_name.upper()
     bad = ["UP-", "DOWN-", "3L-", "3S-", "BULL-", "BEAR-"]
     return any(x in s for x in bad)
 
 # ----------------------------
-# BTC/ETH REJİM (basit ve stabil)
+# BTC/ETH REJİM
 # ----------------------------
 def regime_label() -> tuple[str, str]:
-    """
-    returns: (regime_text, bias) bias in {"LONG", "SHORT", "NEUTRAL", "NO_TRADE"}
-    """
     try:
         btc = fetch_candles("BTC-USDT", TF, 200)
         eth = fetch_candles("ETH-USDT", TF, 200)
@@ -222,7 +212,6 @@ def regime_label() -> tuple[str, str]:
             e50 = ema(c, 50)
             e200 = ema(c, 200)
             r = rsi(c, 14)
-            # trend + momentum
             long_ok = (c.iloc[-1] > e200.iloc[-1]) and (e50.iloc[-1] > e200.iloc[-1]) and (r.iloc[-1] >= 50)
             short_ok = (c.iloc[-1] < e200.iloc[-1]) and (e50.iloc[-1] < e200.iloc[-1]) and (r.iloc[-1] <= 50)
             if long_ok and not short_ok:
@@ -243,8 +232,7 @@ def regime_label() -> tuple[str, str]:
         return ("REGIME: NO TRADE • BTC/ETH error", "NO_TRADE")
 
 # ----------------------------
-# 6 KAPI + RAW SKOR
-# RAW: 0..100 (0=çok güçlü SHORT, 100=çok güçlü LONG)
+# 6 KAPI + RAW
 # ----------------------------
 def compute_raw_and_gates(cdf: pd.DataFrame) -> tuple[float, int]:
     if cdf is None or cdf.empty or len(cdf) < 60:
@@ -270,75 +258,49 @@ def compute_raw_and_gates(cdf: pd.DataFrame) -> tuple[float, int]:
     last_adx = a.iloc[-1]
     last_atr_pct = (at.iloc[-1] / last_close) if last_close else 0.0
 
-    # ------------- 6 GATE (Level-2) -------------
     gates = []
 
-    # Gate 1: Trend (EMA200 + EMA50 konumu)
     gate1_long = (last_close > e200.iloc[-1]) and (e50.iloc[-1] > e200.iloc[-1])
     gate1_short = (last_close < e200.iloc[-1]) and (e50.iloc[-1] < e200.iloc[-1])
     gates.append(gate1_long or gate1_short)
 
-    # Gate 2: Momentum (RSI)
     gate2_long = last_rsi >= 55
     gate2_short = last_rsi <= 45
     gates.append(gate2_long or gate2_short)
 
-    # Gate 3: MACD histogram yönü
     gate3_long = last_hist > 0
     gate3_short = last_hist < 0
     gates.append(gate3_long or gate3_short)
 
-    # Gate 4: Trend strength (ADX)
     gates.append(last_adx >= 18)
 
-    # Gate 5: Volume (son hacim / ort hacim)
     vmean = vol.rolling(20).mean().iloc[-1] if len(vol) >= 20 else vol.mean()
     gates.append(bool(vmean) and (vol.iloc[-1] >= (vmean * 1.2)))
 
-    # Gate 6: Volatility/Noise filtresi (ATR%)
-    # Çok düşük ATR = illiquid / fake; çok yüksek ATR = spike/noise
     gates.append(0.002 <= last_atr_pct <= 0.08)
 
     gate_pass = int(sum(bool(x) for x in gates))
 
-    # ------------- RAW (0..100) -------------
-    # Baz RAW: RSI + trend mesafesi + MACD + ADX (hepsi yumuşak)
-    # Bu ham skor sonra 0..100'e sıkıştırılır.
-    # LONG'u büyütür, SHORT'u küçültür.
-
-    # RSI bileşeni (50 merkez)
-    rsi_component = (last_rsi - 50) * 1.2  # -60..+60 civarı
-
-    # Trend bileşeni (close/EMA200)
+    rsi_component = (last_rsi - 50) * 1.2
     trend_component = 0.0
     if e200.iloc[-1] != 0:
-        trend_component = ((last_close / e200.iloc[-1]) - 1.0) * 400  # -? .. +?
-
-    # MACD hist
-    macd_component = np.tanh(last_hist * 5) * 18  # -18..+18
-
-    # ADX (güç varsa LONG/SHORT sinyalini "keskinleştirir" ama yön vermez)
-    adx_boost = np.tanh((last_adx - 18) / 10) * 10  # -10..+10
-
-    # Kapı sayısı bonusu (çok yumuşak, yapıyı bozmasın)
-    gate_bonus = (gate_pass - 3) * 3  # -9..+9
+        trend_component = ((last_close / e200.iloc[-1]) - 1.0) * 400
+    macd_component = np.tanh(last_hist * 5) * 18
+    adx_boost = np.tanh((last_adx - 18) / 10) * 10
+    gate_bonus = (gate_pass - 3) * 3
 
     raw_unclipped = 50 + rsi_component + trend_component + macd_component + adx_boost + gate_bonus
-
-    # 0..100 clamp
     raw = float(np.clip(raw_unclipped, 0, 100))
-
     return (raw, gate_pass)
 
 # ----------------------------
-# STYLING (Base bozulmadan: LONG yeşil, SHORT kırmızı, STRONG daha koyu)
+# STYLING (Base: LONG yeşil, SHORT kırmızı, STRONG daha koyu)
 # ----------------------------
-def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    # Renkler
-    LONG_BG = "#0f3b2e"          # normal long
-    SHORT_BG = "#4a1212"         # normal short
-    STRONG_LONG_BG = "#0a2a20"   # daha koyu long
-    STRONG_SHORT_BG = "#2c0a0a"  # daha koyu short
+def style_table(df: pd.DataFrame):
+    LONG_BG = "#0f3b2e"
+    SHORT_BG = "#4a1212"
+    STRONG_LONG_BG = "#0a2a20"
+    STRONG_SHORT_BG = "#2c0a0a"
 
     BASE_TEXT = "color: #e8eef6;"
     BORDER = "border-color: #1f2a3a !important;"
@@ -379,37 +341,30 @@ def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
 # EVRENİ TOPLA + HESAPLA
 # ----------------------------
 def build_table():
-    # progress/loader
     prog = st.progress(0, text="⏳ KuCoin USDT evreni hazırlanıyor...")
     t0 = time.time()
 
     tickers = fetch_all_tickers()
 
-    # USDT spot + junk hariç
     tickers = tickers[tickers["symbolName"].apply(is_usdt_spot)]
     tickers = tickers[~tickers["symbolName"].apply(is_junk)]
 
-    # Likidite filtresi (volValue)
     tickers["volValue"] = pd.to_numeric(tickers.get("volValue", 0), errors="coerce").fillna(0.0)
     tickers = tickers[tickers["volValue"] >= VOLVALUE_MIN]
-
-    # Hacme göre sırala ve pratik limit uygula
     tickers = tickers.sort_values("volValue", ascending=False).head(MAX_SYMBOLS).copy()
 
     universe_count = int(len(tickers))
     prog.progress(10, text=f"🧠 Evren (USDT spot): {universe_count} • Likidite filtresi aktif • Tarama başlıyor...")
 
-    # Regime
     reg_txt, bias = regime_label()
     prog.progress(15, text=f"📈 Rejim okunuyor... ({bias})")
 
-    # Tarama
     rows = []
     scanned = 0
     total = universe_count if universe_count else 1
 
     for _, r in tickers.iterrows():
-        sym = r["symbolName"]  # örn: TRX-USDT
+        sym = r["symbolName"]
         qv = safe_float(r.get("volValue", 0.0), 0.0)
         last = safe_float(r.get("last", 0.0), 0.0)
 
@@ -417,8 +372,6 @@ def build_table():
             cdf = fetch_candles(sym, TF, CANDLE_LIMIT)
             raw, gate_pass = compute_raw_and_gates(cdf)
 
-            # bias etkisi (çok hafif, base mantığı bozmasın)
-            # SHORT bias: raw'ı biraz aşağı iter, LONG bias: yukarı iter
             if bias == "SHORT":
                 raw = float(np.clip(raw - 2.0, 0, 100))
             elif bias == "LONG":
@@ -427,7 +380,6 @@ def build_table():
             skor = round_to_step(raw, SCORE_STEP)
             yon = "LONG" if raw >= 50 else "SHORT"
 
-            # STRONG kriteri: hem eşik hem de 6/6 kapı
             strong = False
             if gate_pass >= STRONG_GATES_REQUIRED:
                 if yon == "LONG" and raw >= STRONG_LONG_RAW:
@@ -439,15 +391,13 @@ def build_table():
                 "YÖN": yon,
                 "COIN": sym.replace("-USDT", ""),
                 "SKOR": int(skor),
-                "FİYAT": float(last) if last else float(cdf["close"].iloc[-1]) if (cdf is not None and not cdf.empty) else float("nan"),
+                "FİYAT": float(last) if last else (float(cdf["close"].iloc[-1]) if (cdf is not None and not cdf.empty) else float("nan")),
                 "RAW": float(raw),
                 "QV_24H": float(qv),
                 "KAPI": int(gate_pass),
                 "STRONG": bool(strong),
             })
-
         except Exception:
-            # tek coin fail olursa atla
             pass
 
         scanned += 1
@@ -462,43 +412,25 @@ def build_table():
         prog.progress(100, text="❌ Veri gelmedi (network/KuCoin).")
         return reg_txt, bias, universe_count, 0, pd.DataFrame()
 
-    # ----------------------------
-    # STRONG seç (base mantık): önce STRONG, kalan boşlukları TOP ile doldur
-    # ----------------------------
-    # STRONG havuzu
     strong_df = df[df["STRONG"] == True].copy()
-
-    # LONG tarafında büyük RAW iyidir; SHORT tarafında küçük RAW iyidir.
-    # STRONG'ları önce en "uç" olandan başlayarak sırala.
     strong_df["_rank"] = strong_df.apply(
         lambda x: (100 - x["RAW"]) if x["YÖN"] == "LONG" else x["RAW"],
         axis=1
     )
     strong_df = strong_df.sort_values(["_rank"], ascending=True).drop(columns=["_rank"])
 
-    # hedef tablo boyutu
     TARGET_N = 20
 
-    # ---- fallback TOP havuzu (AŞIRI SERT OLMASIN) ----
-    # Burada kritik düzeltme:
-    # STRONG yoksa bile tablo dolsun diye fallback'te 6/6 kapıyı ZORUNLU yapmıyoruz.
-    # Sadece en az 2 kapı + likidite zaten filtreli.
     fallback_pool = df[df["KAPI"] >= FALLBACK_MIN_GATES].copy()
 
-    # "en yakın" sıralaması:
-    # LONG: RAW 90'a yakın
-    # SHORT: RAW 10'a yakın
     def proximity(row):
         if row["YÖN"] == "LONG":
             return abs(row["RAW"] - STRONG_LONG_RAW)
         return abs(row["RAW"] - STRONG_SHORT_RAW)
 
     fallback_pool["_prox"] = fallback_pool.apply(proximity, axis=1)
-    # aynı prox'ta daha yüksek kapı daha iyi
     fallback_pool = fallback_pool.sort_values(["_prox", "KAPI", "QV_24H"], ascending=[True, False, False])
 
-    # ---- 10/10 denge (estetik) ----
-    # Önce STRONG'ları al, sonra eksik kalan tarafı TOP ile tamamla.
     result = strong_df.copy()
 
     def add_rows(from_df, need, exclude_set):
@@ -514,13 +446,9 @@ def build_table():
         return out
 
     used = set(result["COIN"].tolist())
-    # hedef: 10 long + 10 short (ama STRONG çoksa taşabilir, yine de TARGET_N'e kadar doldur)
-    want_long = 10
-    want_short = 10
-
+    want_long, want_short = 10, 10
     cur_long = int((result["YÖN"] == "LONG").sum()) if not result.empty else 0
     cur_short = int((result["YÖN"] == "SHORT").sum()) if not result.empty else 0
-
     need_long = max(0, want_long - cur_long)
     need_short = max(0, want_short - cur_short)
 
@@ -535,42 +463,29 @@ def build_table():
     if addS:
         result = pd.concat([result, pd.DataFrame(addS)], ignore_index=True)
 
-    # hâlâ eksik varsa (bazı günler SHORT ya da LONG çok az olabilir),
-    # kalan boşluğu prox sırasına göre (karma) doldur.
     if len(result) < TARGET_N:
         need = TARGET_N - len(result)
         addAny = add_rows(fallback_pool, need, used)
         if addAny:
             result = pd.concat([result, pd.DataFrame(addAny)], ignore_index=True)
 
-    # yine de hedefe ulaşamadıysa (çok nadir), en azından en iyi prox adaylarıyla doldur
     result = result.head(TARGET_N).copy()
-
-    # FINAL tablo: SKOR'a göre (LONG yüksek, SHORT düşük) üstte görünsün diye
-    # Kullanıcı "top" istiyor: LONG için yüksek skor; SHORT için düşük skor daha güçlü.
-    # Karma sıralama: STRONG önce, sonra prox, sonra likidite
     result["_prox"] = result.apply(proximity, axis=1)
-    result = result.sort_values(
-        ["STRONG", "_prox", "QV_24H"],
-        ascending=[False, True, False]
-    ).drop(columns=["_prox"])
+    result = result.sort_values(["STRONG", "_prox", "QV_24H"], ascending=[False, True, False]).drop(columns=["_prox"])
 
     prog.progress(100, text=f"✅ Bitti • {int(time.time()-t0)}s")
 
     return reg_txt, bias, universe_count, len(df), result.reset_index(drop=True)
 
 # ----------------------------
-# ÇALIŞTIR + CACHE (boş ekranda son tabloyu göster)
+# ÇALIŞTIR + CACHE
 # ----------------------------
 if "last_df" not in st.session_state:
     st.session_state.last_df = pd.DataFrame()
-if "last_msg" not in st.session_state:
-    st.session_state.last_msg = ""
 
 try:
     reg_txt, bias, ucount, scanned_count, out = build_table()
 
-    # üst rejim bandı
     if "SHORT BIAS" in reg_txt:
         st.markdown(f"<div class='sniper-warn'>⛔ {reg_txt}</div>", unsafe_allow_html=True)
     elif "LONG BIAS" in reg_txt:
@@ -580,29 +495,16 @@ try:
     else:
         st.markdown(f"<div class='sniper-warn'>⚠️ {reg_txt}</div>", unsafe_allow_html=True)
 
-    # evren kartı
     if out is None or out.empty:
-        # bu durumda son başarılı tabloyu göster
         if st.session_state.last_df is not None and not st.session_state.last_df.empty:
-            st.markdown(
-                "<div class='sniper-warn'>⚠️ Bu turda veri gelmedi (network/KuCoin). Son başarılı tarama gösteriliyor.</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown("<div class='sniper-warn'>⚠️ Bu turda veri gelmedi (network/KuCoin). Son başarılı tarama gösteriliyor.</div>", unsafe_allow_html=True)
             out = st.session_state.last_df.copy()
         else:
-            st.markdown(
-                "<div class='sniper-warn'>⚠️ Aday yok (network/KuCoin veya filtre çok sert). Bir sonraki auto refresh’i bekle.</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown("<div class='sniper-warn'>⚠️ Aday yok (network/KuCoin veya filtre çok sert). Bir sonraki auto refresh’i bekle.</div>", unsafe_allow_html=True)
 
-    # out doluysa cachele
     if out is not None and not out.empty:
         st.session_state.last_df = out.copy()
 
-    # ----------------------------
-    # SAYILAR (Strong long/short + long/short)
-    # ----------------------------
-    if out is not None and not out.empty:
         strong_long = int(((out["YÖN"] == "LONG") & (out["STRONG"] == True)).sum())
         strong_short = int(((out["YÖN"] == "SHORT") & (out["STRONG"] == True)).sum())
         long_cnt = int((out["YÖN"] == "LONG").sum())
@@ -620,24 +522,16 @@ try:
         )
 
     st.markdown("## 🎯 SNIPER TABLO")
+
     if out is not None and not out.empty:
         show = out[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI", "STRONG"]].copy()
-
-        # STRONG metni (görselde ayrı renk zaten var ama checkbox gibi dursun)
-        # istersen STRONG kolonu gizleyebiliriz; şimdilik dursun.
-        sty = style_table(show)
-
-        st.dataframe(sty, use_container_width=True, hide_index=True)
+        st.dataframe(style_table(show), use_container_width=True, hide_index=True)
     else:
         st.markdown("<div class='sniper-warn'>⚠️ Tablo boş.</div>", unsafe_allow_html=True)
 
 except Exception as e:
-    # Tam çöküşte de son tabloyu bas
     if st.session_state.last_df is not None and not st.session_state.last_df.empty:
-        st.markdown(
-            "<div class='sniper-warn'>⚠️ Uygulama bu turda hata verdi. Son başarılı tarama gösteriliyor.</div>",
-            unsafe_allow_html=True
-        )
+        st.markdown("<div class='sniper-warn'>⚠️ Uygulama bu turda hata verdi. Son başarılı tarama gösteriliyor.</div>", unsafe_allow_html=True)
         show = st.session_state.last_df.copy()
         show = show[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI", "STRONG"]]
         st.dataframe(style_table(show), use_container_width=True, hide_index=True)
