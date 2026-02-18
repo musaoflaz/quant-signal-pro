@@ -29,7 +29,7 @@ SCORE_STEP = 5
 
 # Evren çok büyük (900+). Cloud timeout yememek için likidite filtresi + cap
 MIN_QUOTE_VOL_24H = 10_000  # USDT
-MAX_SCAN_SYMBOLS = 450      # gerekirse yükseltiriz
+MAX_SCAN_SYMBOLS = 450      # gerekirse sonra artırırız
 
 # Ağırlıklar (toplam ~100)
 W_RSI = 22
@@ -179,7 +179,6 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 def quantize_score(x: float, step: int = 5) -> int:
-    # 0..100 arası, step'e yuvarla
     x = clamp(x, 0, 100)
     q = int(round(x / step) * step)
     return int(clamp(q, 0, 100))
@@ -187,7 +186,7 @@ def quantize_score(x: float, step: int = 5) -> int:
 
 def score_one(df: pd.DataFrame) -> tuple[int, int, str]:
     """
-    returns: (score_quantized, raw_best, direction)
+    returns: (score_quantized, raw_best_int, direction)
     """
     close = df["close"].astype(float)
     high = df["high"].astype(float)
@@ -197,12 +196,12 @@ def score_one(df: pd.DataFrame) -> tuple[int, int, str]:
     if len(close) < 60:
         return 0, 0, "—"
 
-    rsi = rsi_wilder(close, 14).iloc[-1]
-    mid, up, low_bb = bollinger(close, 20, 2.0)
+    rsi = float(rsi_wilder(close, 14).iloc[-1])
+    _, up, low_bb = bollinger(close, 20, 2.0)
     sma20 = sma(close, 20)
-    macd_line, macd_sig, macd_hist = macd(close)
-    adx_v = adx(high, low, close, 14).iloc[-1]
-    atr_v = atr(high, low, close, 14).iloc[-1]
+    _, _, macd_hist = macd(close)
+    adx_v = float(adx(high, low, close, 14).iloc[-1])
+    atr_v = float(atr(high, low, close, 14).iloc[-1])
 
     last = float(close.iloc[-1])
     prev = float(close.iloc[-2])
@@ -223,75 +222,64 @@ def score_one(df: pd.DataFrame) -> tuple[int, int, str]:
     vol_sma = float(sma(vol, 20).iloc[-1]) if len(vol) >= 20 else float(vol.mean())
     vol_ratio = (float(vol.iloc[-1]) / vol_sma) if vol_sma > 0 else 1.0
 
-    # -------------- bileşen skorları --------------
     long_raw = 0.0
     short_raw = 0.0
 
-    # RSI (low -> long, high -> short)
-    # 25 altı çok güçlü long, 75 üstü çok güçlü short
+    # RSI
     long_raw += W_RSI * clamp((50.0 - rsi) / 25.0, 0.0, 1.0)
     short_raw += W_RSI * clamp((rsi - 50.0) / 25.0, 0.0, 1.0)
 
-    # Bollinger (alt banda yakın -> long, üst banda yakın -> short)
+    # Bollinger
     long_raw += W_BB * clamp((0.35 - bb_pos) / 0.35, 0.0, 1.0)
     short_raw += W_BB * clamp((bb_pos - 0.65) / 0.35, 0.0, 1.0)
 
-    # Trend (SMA20 üstü + SMA yükseliyor -> long, tersi -> short)
+    # Trend (SMA20 + slope)
     sma_slope = last_sma - prev_sma
     if last > last_sma and sma_slope > 0:
         long_raw += W_TREND
     elif last < last_sma and sma_slope < 0:
         short_raw += W_TREND
     else:
-        # trend net değilse düşük puan
         if last > last_sma:
             long_raw += W_TREND * 0.35
         elif last < last_sma:
             short_raw += W_TREND * 0.35
 
-    # MACD hist (pozitif -> long, negatif -> short)
-    # hist büyüklüğünü normalize et
+    # MACD hist
     hist_norm = clamp(abs(hist) / (abs(last) * 0.002 + 1e-9), 0.0, 1.0)
     if hist > 0:
         long_raw += W_MACD * hist_norm
     elif hist < 0:
         short_raw += W_MACD * hist_norm
 
-    # ADX (trend güç filtresi): adx düşükse ikisini de kırp
-    # 18 altı zayıf, 25 üstü iyi
+    # ADX (trend strength)
     adx_mult = 0.65 + 0.35 * clamp((adx_v - 18.0) / 12.0, 0.0, 1.0)
-    # ayrıca ADX bileşen puanı da ekleyelim (trend varsa)
     adx_bonus = W_ADX * clamp((adx_v - 18.0) / 18.0, 0.0, 1.0)
     long_raw += adx_bonus * (1.0 if last > last_sma else 0.4)
     short_raw += adx_bonus * (1.0 if last < last_sma else 0.4)
 
-    # ATR% (aşırı oynaksa ceza)
-    # 1-4% ideal, 6% üstü risk -> puanı kır
+    # ATR% penalty
     if atr_pct <= 4.0:
         atr_mult = 1.0
     elif atr_pct >= 8.0:
         atr_mult = 0.75
     else:
-        # 4..8 lineer düş
         atr_mult = 1.0 - (atr_pct - 4.0) * (0.25 / 4.0)
-    # ATR bileşeni: düşük-orta volatiliteye küçük bonus
+
     atr_bonus = W_ATR * clamp((4.0 - atr_pct) / 4.0, 0.0, 1.0)
     long_raw += atr_bonus * 0.6
     short_raw += atr_bonus * 0.6
 
-    # Volume spike: trend yönüyle uyumluysa bonus
+    # Volume spike bonus
     vol_boost = W_VOL * clamp((vol_ratio - 1.2) / 1.0, 0.0, 1.0)
     if last > last_sma:
         long_raw += vol_boost
     elif last < last_sma:
         short_raw += vol_boost
 
-    # -------------- multipliers --------------
     long_raw *= adx_mult * atr_mult
     short_raw *= adx_mult * atr_mult
 
-    # -------------- final --------------
-    # 0..100'e normalize et (ağırlık toplamına göre)
     weight_sum = float(W_RSI + W_BB + W_TREND + W_MACD + W_ADX + W_ATR + W_VOL)
     long_score = (long_raw / weight_sum) * 100.0
     short_score = (short_raw / weight_sum) * 100.0
@@ -313,19 +301,44 @@ def score_one(df: pd.DataFrame) -> tuple[int, int, str]:
 # =============================
 st.set_page_config(page_title="KuCoin PRO Sniper — Auto (LONG+SHORT)", layout="wide")
 
+# ✅ BOZMADAN: SADECE OKUNURLUK / KOYU TEMA ZORLA
 st.markdown(
     """
 <style>
-/* Koyu tema sabit */
-html, body, [class*="css"]  { background-color: #0b0f14 !important; }
-.block-container { padding-top: 1.0rem; padding-bottom: 2rem; }
-h1,h2,h3,h4,p,span,div { color: #e6edf3 !important; }
-[data-testid="stHeader"] { background: rgba(0,0,0,0) !important; }
-[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
+:root { color-scheme: dark !important; }
 
-/* Tablo yazıları daha net */
-thead tr th { color: #e6edf3 !important; background: #0f172a !important; }
-tbody tr td { color: #e6edf3 !important; background: #0b0f14 !important; }
+/* Ana zemin */
+html, body, [data-testid="stAppViewContainer"]{
+  background: #0b0f14 !important;
+  color: #e6edf3 !important;
+}
+
+/* iOS bazen soluk yapıyor: bunu kır */
+* { opacity: 1 !important; }
+
+/* Metinler */
+h1,h2,h3,h4,h5,h6,p,span,div,label{
+  color: #e6edf3 !important;
+}
+
+/* Header */
+[data-testid="stHeader"]{ background: rgba(0,0,0,0) !important; }
+
+/* Dataframe alanı */
+[data-testid="stDataFrame"]{
+  background: #0b0f14 !important;
+  border: 1px solid #1f2a37 !important;
+}
+
+/* Tablo başlıkları */
+thead tr th{
+  background: #0f172a !important;
+  color: #e6edf3 !important;
+  border-bottom: 1px solid #1f2a37 !important;
+}
+tbody tr td{
+  border-bottom: 1px solid #111827 !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -360,9 +373,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.write("")
+
 
 # =============================
-# TARMA
+# TARAMA
 # =============================
 ex = make_exchange()
 
@@ -381,7 +396,10 @@ for s in syms:
 ranked.sort(key=lambda x: x[1], reverse=True)
 scan_list = [s for s, _ in ranked[:MAX_SCAN_SYMBOLS]]
 
-st.info(f"Evren (USDT spot): {len(syms)} • Likidite filtresi sonrası: {len(ranked)} • Tarama: {len(scan_list)}", icon="🧠")
+st.info(
+    f"Evren (USDT spot): {len(syms)} • Likidite filtresi sonrası: {len(ranked)} • Tarama: {len(scan_list)}",
+    icon="🧠",
+)
 
 progress = st.progress(0)
 status = st.empty()
@@ -438,7 +456,7 @@ status.empty()
 
 out = pd.DataFrame(rows)
 if out.empty:
-    st.error("Sonuç yok. (KuCoin ağ / rate-limit olabilir) Bir sonraki auto refresh'i bekle.")
+    st.error("Sonuç yok. (KuCoin ağ / rate-limit olabilir) Bir sonraki auto refresh’i bekle.")
     st.stop()
 
 # STRONG öncelik, sonra TOP ile doldur
@@ -448,14 +466,22 @@ rest_df = out[out["SKOR"] < STRONG_MIN_SCORE].copy()
 strong_df = strong_df.sort_values(["SKOR", "QV_24H"], ascending=[False, False])
 rest_df = rest_df.sort_values(["SKOR", "QV_24H"], ascending=[False, False])
 
-final = pd.concat([strong_df, rest_df], axis=0).drop_duplicates(subset=["COIN"]).head(TABLE_SIZE).reset_index(drop=True)
+final = (
+    pd.concat([strong_df, rest_df], axis=0)
+    .drop_duplicates(subset=["COIN"])
+    .head(TABLE_SIZE)
+    .reset_index(drop=True)
+)
 
 if len(strong_df) > 0:
-    st.success(f"✅ STRONG bulundu. Önce STRONG gösteriliyor (SKOR≥{STRONG_MIN_SCORE}), boş kalırsa TOP ile doluyor.", icon="✅")
+    st.success(
+        f"✅ STRONG bulundu. Önce STRONG gösteriliyor (SKOR≥{STRONG_MIN_SCORE}), boş kalırsa TOP ile doluyor.",
+        icon="✅",
+    )
 else:
-    st.warning(f"⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu.", icon="⚠️")
+    st.warning("⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu.", icon="⚠️")
 
-# Renklendirme (YÖN ve SKOR)
+
 def style_table(df: pd.DataFrame):
     def dir_style(v):
         if str(v) == "LONG":
@@ -466,14 +492,14 @@ def style_table(df: pd.DataFrame):
 
     def score_style(v):
         try:
-            v = int(v)
+            x = int(v)
         except Exception:
             return ""
-        if v >= STRONG_MIN_SCORE:
+        if x >= STRONG_MIN_SCORE:
             return "background-color:#065f46; color:#ffffff; font-weight:900;"
-        if v >= 75:
+        if x >= 75:
             return "background-color:#14532d; color:#ffffff; font-weight:800;"
-        if v <= 35:
+        if x <= 35:
             return "background-color:#7f1d1d; color:#ffffff; font-weight:800;"
         return ""
 
@@ -489,9 +515,8 @@ def style_table(df: pd.DataFrame):
         .set_properties(**{"border-color": "#1f2a37"})
     )
 
+
 st.subheader("🎯 SNIPER TABLO")
 st.dataframe(style_table(final), use_container_width=True, height=720)
 
-st.caption(
-    "Not: Bu sürüm ‘menüsüz’ ve otomatik. İstersen bir sonraki adımda MAX_SCAN_SYMBOLS/likidite filtresini ayarlanabilir yaparız (ama sen istemediğin için şimdilik sabit)."
-)
+st.caption("Not: Bu sürüm menüsüz ve otomatik. Tema/okunurluk fix sadece görünümü etkiler; skor mantığı aynı kalır.")
