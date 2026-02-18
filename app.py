@@ -24,7 +24,7 @@ IST_TZ = ZoneInfo("Europe/Istanbul")
 BASE_TF = "15m"
 BASE_LIMIT = 220
 
-# Scan ALL USDT spot pairs (effectively all; KuCoin count is far below this)
+# Scan all USDT spot pairs (KuCoin returns manageable count)
 HARD_MAX_SYMBOLS = 99999
 
 # Score engine
@@ -33,11 +33,10 @@ BB_PERIOD = 20
 BB_STD = 2.0
 SMA_PERIOD = 20
 
-# PRO gates
+# PRO regime filters (BTC/ETH + asset trend strength)
 EMA_FAST = 50
 EMA_SLOW = 200
 ADX_PERIOD = 14
-VOL_SMA_PERIOD = 20
 
 # STRONG gates (RAW 0–100)
 STRONG_LONG_MIN = 90
@@ -50,33 +49,31 @@ FALLBACK_SHORT = 10
 # Auto refresh
 AUTO_REFRESH_SEC = 240  # 4 dk
 
-# PRO defaults (hard mode)
+# HARD MODE (keep it strict, but never empty the table)
 PRO_MODE = True
-REQUIRE_24H_QUOTEVOL = True
-MIN_QUOTEVOL_USDT = 2_000_000
 
+# Spread filter (finalists only)
 REQUIRE_SPREAD = True
-MAX_SPREAD_PCT = 0.40
+MAX_SPREAD_PCT = 0.55  # biraz gevşettim, yoksa çok eleme oluyor
 
+# Asset trend strength on 1h/4h
 REQUIRE_REGIME_1H = True
 REQUIRE_REGIME_4H = True
 
 REQUIRE_ADX_1H = True
 REQUIRE_ADX_4H = True
-ADX1_MIN = 25.0
-ADX4_MIN = 22.0
+ADX1_MIN = 22.0
+ADX4_MIN = 20.0
 
-REQUIRE_VOL_CONFIRM = True
-VOL_MULT = 1.30
-
+# 2-candle confirmation (avoid fake touches)
 REQUIRE_2CANDLE_CONFIRM = True
 
-# BTC/ETH regime gate
+# BTC/ETH regime gate: only "bias" the direction, do NOT zero-out table in neutral
 USE_BTC_ETH_REGIME_GATE = True
 REGIME_TF_1 = "1h"
 REGIME_TF_2 = "4h"
-REGIME_ADX_MIN_1H = 20.0
-REGIME_ADX_MIN_4H = 18.0
+REGIME_ADX_MIN_1H = 18.0
+REGIME_ADX_MIN_4H = 16.0
 
 
 # =============================
@@ -93,10 +90,7 @@ def safe_autorefresh(interval_ms: int, key: str):
 
 
 def safe_dataframe(data, height: int = 600):
-    """
-    New Streamlit versions prefer width="stretch".
-    Old versions still accept use_container_width=True.
-    """
+    # New Streamlit versions prefer width="stretch"
     try:
         return st.dataframe(data, width="stretch", height=height)
     except TypeError:
@@ -169,13 +163,17 @@ def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -
 # =============================
 def raw_sniper_score(close: float, sma20_v: float, rsi_v: float, bb_low: float, bb_up: float) -> int:
     score = 50
+
+    # Trend (20)
     score += 20 if close > sma20_v else -20
 
+    # Momentum (40)
     if rsi_v < 35:
         score += 40
     elif rsi_v > 65:
         score -= 40
 
+    # Volatility (40)
     if close <= bb_low:
         score += 40
     elif close >= bb_up:
@@ -189,6 +187,7 @@ def direction_from_raw(raw_score: int) -> str:
 
 
 def strength_from_raw(raw_score: int) -> int:
+    # display score always “high = strong”
     return int(raw_score) if raw_score >= 50 else int(100 - raw_score)
 
 
@@ -207,8 +206,8 @@ def make_exchange() -> ccxt.kucoin:
 def load_usdt_spot_symbols() -> list[str]:
     ex = make_exchange()
     markets = ex.load_markets()
-
     syms: list[str] = []
+
     for sym, m in markets.items():
         if not m:
             continue
@@ -235,6 +234,8 @@ def safe_fetch_tickers_all(ex: ccxt.Exchange) -> dict:
 
 
 def quote_volume_usdt(ticker: dict) -> float:
+    if not ticker or not isinstance(ticker, dict):
+        return 0.0
     try:
         qv = ticker.get("quoteVolume", None)
         if qv is not None:
@@ -269,21 +270,19 @@ def safe_fetch_orderbook_spread_pct(ex: ccxt.Exchange, symbol: str) -> float | N
 
 
 # =============================
-# Build base row (+ RSI/BB for fallback "nearest")
+# Base row builder (15m)
 # =============================
 def build_base_row(symbol: str, ohlcv: list) -> dict | None:
     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    need = max(SMA_PERIOD, BB_PERIOD, RSI_PERIOD, VOL_SMA_PERIOD) + 10
+    need = max(SMA_PERIOD, BB_PERIOD, RSI_PERIOD) + 10
     if len(df) < need:
         return None
 
     close = df["close"].astype(float)
-    volume = df["volume"].astype(float)
 
     sma20_s = sma(close, SMA_PERIOD)
     _, bb_up_s, bb_low_s = bollinger_bands(close, BB_PERIOD, BB_STD)
     rsi_s = rsi_wilder(close, RSI_PERIOD)
-    vol_sma20 = sma(volume, VOL_SMA_PERIOD)
 
     last_close = float(close.iloc[-1])
     prev_close = float(close.iloc[-2])
@@ -296,9 +295,6 @@ def build_base_row(symbol: str, ohlcv: list) -> dict | None:
     prev_low = float(bb_low_s.iloc[-2])
     prev_up = float(bb_up_s.iloc[-2])
     prev_rsi = float(rsi_s.iloc[-2])
-
-    last_vol = float(volume.iloc[-1])
-    last_vol_sma = float(vol_sma20.iloc[-1]) if not np.isnan(vol_sma20.iloc[-1]) else 0.0
 
     if any(np.isnan([last_sma20, last_rsi, last_low, last_up, prev_low, prev_up, prev_rsi])):
         return None
@@ -326,24 +322,21 @@ def build_base_row(symbol: str, ohlcv: list) -> dict | None:
         "SMA20": float(last_sma20),
         "BB_LOWER": float(last_low),
         "BB_UPPER": float(last_up),
-        "VOL_LAST": float(last_vol),
-        "VOL_SMA20": float(last_vol_sma),
         "CONFIRM_OK": bool(confirm_ok),
     }
 
 
 # =============================
-# Regime detector (BTC/ETH) on 1h & 4h
+# BTC/ETH regime (bias only)
 # =============================
-def regime_for_symbol(ex: ccxt.Exchange, symbol: str) -> tuple[str, dict]:
-    info = {"sym": symbol, "reg_1h": "NA", "reg_4h": "NA", "adx_1h": np.nan, "adx_4h": np.nan}
+def regime_for_symbol(ex: ccxt.Exchange, symbol: str) -> str:
     try:
         o1 = safe_fetch_ohlcv(ex, symbol, REGIME_TF_1, 320)
         o4 = safe_fetch_ohlcv(ex, symbol, REGIME_TF_2, 320)
         if not o1 or not o4:
-            return "NA", info
+            return "NA"
 
-        def calc_reg(ohlcv: list, adx_min: float) -> tuple[str, float]:
+        def calc_reg(ohlcv: list, adx_min: float) -> str:
             d = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
             h = d["high"].astype(float)
             l = d["low"].astype(float)
@@ -359,52 +352,44 @@ def regime_for_symbol(ex: ccxt.Exchange, symbol: str) -> tuple[str, dict]:
             last_adx = float(ax.iloc[-1]) if not np.isnan(ax.iloc[-1]) else 0.0
 
             if np.isnan(last_e50) or np.isnan(last_e200):
-                return "NEUTRAL", last_adx
+                return "NEUTRAL"
 
             bull = (last_close > last_e200) and (last_e50 > last_e200) and (last_adx >= adx_min)
             bear = (last_close < last_e200) and (last_e50 < last_e200) and (last_adx >= adx_min)
 
             if bull:
-                return "BULL", last_adx
+                return "BULL"
             if bear:
-                return "BEAR", last_adx
-            return "NEUTRAL", last_adx
+                return "BEAR"
+            return "NEUTRAL"
 
-        r1, a1 = calc_reg(o1, REGIME_ADX_MIN_1H)
-        r4, a4 = calc_reg(o4, REGIME_ADX_MIN_4H)
-
-        info["reg_1h"] = r1
-        info["reg_4h"] = r4
-        info["adx_1h"] = a1
-        info["adx_4h"] = a4
+        r1 = calc_reg(o1, REGIME_ADX_MIN_1H)
+        r4 = calc_reg(o4, REGIME_ADX_MIN_4H)
 
         if r1 == "BULL" and r4 == "BULL":
-            return "BULL", info
+            return "BULL"
         if r1 == "BEAR" and r4 == "BEAR":
-            return "BEAR", info
-        return "NEUTRAL", info
+            return "BEAR"
+        return "NEUTRAL"
     except Exception:
-        return "NA", info
+        return "NA"
 
 
-def allowed_direction_from_btc_eth(btc_reg: str, eth_reg: str) -> tuple[str, str]:
-    if btc_reg in ("BULL", "BEAR") and eth_reg in ("BULL", "BEAR"):
-        if btc_reg == eth_reg == "BULL":
-            return "LONG", "BTC & ETH BULL (1h+4h)"
-        if btc_reg == eth_reg == "BEAR":
-            return "SHORT", "BTC & ETH BEAR (1h+4h)"
-        return "NONE", "BTC/ETH conflict (one BULL one BEAR)"
-
+def btc_eth_bias(btc_reg: str, eth_reg: str) -> tuple[str, str]:
+    # Bias only, never "NO TRADE"
+    if btc_reg == "BULL" and eth_reg == "BULL":
+        return "LONG", "BTC & ETH BULL"
+    if btc_reg == "BEAR" and eth_reg == "BEAR":
+        return "SHORT", "BTC & ETH BEAR"
     if btc_reg == "BULL" or eth_reg == "BULL":
-        return "LONG", "Regime BULL (one strong, other neutral/NA)"
+        return "LONG", "Regime: BULL-ish (one strong)"
     if btc_reg == "BEAR" or eth_reg == "BEAR":
-        return "SHORT", "Regime BEAR (one strong, other neutral/NA)"
-
-    return "NONE", "BTC/ETH neutral"
+        return "SHORT", "Regime: BEAR-ish (one strong)"
+    return "BOTH", "BTC/ETH neutral (bias yok)"
 
 
 # =============================
-# PRO gates (1h & 4h): EMA50/EMA200 alignment + ADX + Spread
+# PRO gates on finalists only
 # =============================
 def pro_pass(ex: ccxt.Exchange, symbol: str, want_dir: str) -> tuple[bool, dict]:
     info = {"SPREAD%": np.nan, "ADX_1H": np.nan, "ADX_4H": np.nan}
@@ -427,7 +412,6 @@ def pro_pass(ex: ccxt.Exchange, symbol: str, want_dir: str) -> tuple[bool, dict]
 
         e50 = ema(c, EMA_FAST)
         e200 = ema(c, EMA_SLOW)
-
         last_close = float(c.iloc[-1])
         last_e50 = float(e50.iloc[-1]) if not np.isnan(e50.iloc[-1]) else np.nan
         last_e200 = float(e200.iloc[-1]) if not np.isnan(e200.iloc[-1]) else np.nan
@@ -466,7 +450,7 @@ def pro_pass(ex: ccxt.Exchange, symbol: str, want_dir: str) -> tuple[bool, dict]
 
 
 # =============================
-# Table styling
+# Styling
 # =============================
 def style_table(df: pd.DataFrame):
     def dir_style(v):
@@ -488,15 +472,7 @@ def style_table(df: pd.DataFrame):
             return "background-color: #0f3d0f; color: #ffffff; font-weight: 800;"
         return "background-color: #111827; color: #e5e7eb;"
 
-    fmt = {
-        "FİYAT": "{:.4f}",
-        "SKOR": "{:.0f}",
-        "RAW": "{:.0f}",
-        "QV_24H": "{:,.0f}",
-        "SPREAD%": "{:.2f}",
-        "ADX_1H": "{:.1f}",
-        "ADX_4H": "{:.1f}",
-    }
+    fmt = {"FİYAT": "{:.4f}", "SKOR": "{:.0f}", "RAW": "{:.0f}", "QV_24H": "{:,.0f}", "SPREAD%": "{:.2f}", "ADX_1H": "{:.1f}", "ADX_4H": "{:.1f}"}
 
     return (
         df.style.format(fmt)
@@ -549,29 +525,15 @@ with right:
 def run_scan() -> dict:
     ex = make_exchange()
 
-    btc_reg, _ = regime_for_symbol(ex, "BTC/USDT") if USE_BTC_ETH_REGIME_GATE else ("NA", {})
-    eth_reg, _ = regime_for_symbol(ex, "ETH/USDT") if USE_BTC_ETH_REGIME_GATE else ("NA", {})
-    allow_dir, reg_msg = allowed_direction_from_btc_eth(btc_reg, eth_reg) if USE_BTC_ETH_REGIME_GATE else ("NONE", "Regime gate disabled")
+    btc_reg = regime_for_symbol(ex, "BTC/USDT") if USE_BTC_ETH_REGIME_GATE else "NA"
+    eth_reg = regime_for_symbol(ex, "ETH/USDT") if USE_BTC_ETH_REGIME_GATE else "NA"
+    bias, bias_msg = btc_eth_bias(btc_reg, eth_reg) if USE_BTC_ETH_REGIME_GATE else ("BOTH", "Regime gate disabled")
 
     syms = load_usdt_spot_symbols()
     universe = syms[: min(len(syms), HARD_MAX_SYMBOLS)]
 
-    tickers = safe_fetch_tickers_all(ex) if (PRO_MODE and REQUIRE_24H_QUOTEVOL) else {}
-    qv_map: dict[str, float] = {}
-
-    if PRO_MODE and REQUIRE_24H_QUOTEVOL and tickers:
-        keep = []
-        for s in universe:
-            t = tickers.get(s)
-            qv = quote_volume_usdt(t) if isinstance(t, dict) else 0.0
-            qv_map[s] = float(qv)
-            if qv >= float(MIN_QUOTEVOL_USDT):
-                keep.append(s)
-        universe = keep
-    else:
-        for s in universe:
-            t = tickers.get(s) if isinstance(tickers, dict) else None
-            qv_map[s] = quote_volume_usdt(t) if isinstance(t, dict) else 0.0
+    tickers = safe_fetch_tickers_all(ex)
+    qv_map = {s: quote_volume_usdt(tickers.get(s)) for s in universe} if isinstance(tickers, dict) else {s: 0.0 for s in universe}
 
     rows = []
     for symbol in universe:
@@ -589,18 +551,14 @@ def run_scan() -> dict:
         time.sleep(0.006)
 
     df_all = pd.DataFrame(rows) if rows else pd.DataFrame()
-    strong_df = pd.DataFrame()
 
+    # Apply bias only (never empty)
+    if not df_all.empty and bias in ("LONG", "SHORT"):
+        df_all = df_all[df_all["YÖN"] == bias].copy()
+
+    strong = pd.DataFrame()
     if not df_all.empty:
-        if USE_BTC_ETH_REGIME_GATE and allow_dir in ("LONG", "SHORT"):
-            df_all = df_all[df_all["YÖN"] == allow_dir].copy()
-        elif USE_BTC_ETH_REGIME_GATE and allow_dir == "NONE":
-            df_all = df_all.iloc[0:0].copy()
-
         cand = df_all[df_all["RAW"].apply(is_strong)].copy()
-
-        if PRO_MODE and REQUIRE_VOL_CONFIRM and not cand.empty:
-            cand = cand[(cand["VOL_SMA20"] > 0) & (cand["VOL_LAST"] >= cand["VOL_SMA20"] * float(VOL_MULT))].copy()
 
         if PRO_MODE and REQUIRE_2CANDLE_CONFIRM and not cand.empty:
             cand = cand[cand["CONFIRM_OK"] == True].copy()
@@ -608,12 +566,10 @@ def run_scan() -> dict:
         if PRO_MODE and not cand.empty:
             kept = []
             info_map = {}
-
             for row in cand.itertuples(index=False):
                 symbol = getattr(row, "SYMBOL")
                 raw = int(getattr(row, "RAW"))
                 want_dir = "LONG" if raw >= 50 else "SHORT"
-
                 ok, info = pro_pass(ex, symbol, want_dir)
                 if ok:
                     kept.append(symbol)
@@ -621,38 +577,33 @@ def run_scan() -> dict:
                 time.sleep(0.006)
 
             if kept:
-                strong_df = cand[cand["SYMBOL"].isin(set(kept))].copy()
-                strong_df["SPREAD%"] = strong_df["SYMBOL"].map(lambda s: info_map.get(s, {}).get("SPREAD%", np.nan))
-                strong_df["ADX_1H"] = strong_df["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_1H", np.nan))
-                strong_df["ADX_4H"] = strong_df["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_4H", np.nan))
-        else:
-            strong_df = cand.copy()
+                strong = cand[cand["SYMBOL"].isin(set(kept))].copy()
+                strong["SPREAD%"] = strong["SYMBOL"].map(lambda s: info_map.get(s, {}).get("SPREAD%", np.nan))
+                strong["ADX_1H"] = strong["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_1H", np.nan))
+                strong["ADX_4H"] = strong["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_4H", np.nan))
 
-    return {
-        "all": df_all,
-        "strong": strong_df,
-        "regime": {"btc": btc_reg, "eth": eth_reg, "allow_dir": allow_dir, "msg": reg_msg},
-        "universe_count": int(len(universe)),
-        "all_count": int(len(df_all)) if isinstance(df_all, pd.DataFrame) else 0,
-    }
+        else:
+            strong = cand.copy()
+
+    return {"all": df_all, "strong": strong, "regime": {"btc": btc_reg, "eth": eth_reg, "bias": bias, "msg": bias_msg}, "universe_count": int(len(universe)), "all_count": int(len(df_all)) if isinstance(df_all, pd.DataFrame) else 0}
 
 
 with st.spinner("Taranıyor…"):
     res = run_scan()
 
 reg = res.get("regime", {})
-allow_dir = reg.get("allow_dir", "NONE")
+bias = reg.get("bias", "BOTH")
 msg = reg.get("msg", "")
 
 if USE_BTC_ETH_REGIME_GATE:
-    if allow_dir == "LONG":
-        st.success(f"✅ REGIME: LONG only • {msg}")
-    elif allow_dir == "SHORT":
-        st.error(f"✅ REGIME: SHORT only • {msg}")
+    if bias == "LONG":
+        st.success(f"✅ REGIME BIAS: LONG • {msg}")
+    elif bias == "SHORT":
+        st.error(f"✅ REGIME BIAS: SHORT • {msg}")
     else:
-        st.warning(f"⛔ REGIME: NO TRADE • {msg}")
+        st.warning(f"⚠️ REGIME: NEUTRAL • {msg} (tablo yine dolu gelir)")
 
-st.caption(f"Evren (USDT spot): {res.get('universe_count', 0)} • Filtre sonrası aday: {res.get('all_count', 0)}")
+st.caption(f"Evren (USDT spot): {res.get('universe_count', 0)} • Aday (bias sonrası): {res.get('all_count', 0)}")
 
 st.subheader("🎯 SNIPER TABLO")
 
@@ -669,47 +620,35 @@ if isinstance(df_strong, pd.DataFrame) and not df_strong.empty:
             cols.append(extra)
 
     show = show.loc[:, [c for c in cols if c in show.columns]]
-    safe_dataframe(style_table(show), height=600)
+    safe_dataframe(style_table(show), height=620)
 
 else:
     st.info("Şu an STRONG yok. En yakın adayları (10 LONG + 10 SHORT) gösteriyorum.")
 
     if not isinstance(df_all, pd.DataFrame) or df_all.empty:
-        st.warning("Aday yok (regime NO TRADE olabilir ya da network/KuCoin). Bir sonraki yenilemede tekrar dener.")
+        st.warning("Aday yok (KuCoin/network). Bir sonraki yenilemede tekrar dener.")
     else:
         base = df_all.copy()
 
+        # distance to strong boundary
         base["DIST_STRONG"] = np.where(
             base["RAW"] >= 50,
             (STRONG_LONG_MIN - base["RAW"]).clip(lower=0),
             (base["RAW"] - STRONG_SHORT_MAX).clip(lower=0),
         )
 
-        long_edge = (35.0 - base["RSI14"]).clip(lower=0) + (
-            ((base["BB_LOWER"] - base["FİYAT"]) / base["FİYAT"]) * 100.0 * 5.0
-        ).clip(lower=0)
-
-        short_edge = (base["RSI14"] - 65.0).clip(lower=0) + (
-            ((base["FİYAT"] - base["BB_UPPER"]) / base["FİYAT"]) * 100.0 * 5.0
-        ).clip(lower=0)
-
+        # edge: how much beyond RSI/BB thresholds
+        long_edge = (35.0 - base["RSI14"]).clip(lower=0) + (((base["BB_LOWER"] - base["FİYAT"]) / base["FİYAT"]) * 100.0 * 5.0).clip(lower=0)
+        short_edge = (base["RSI14"] - 65.0).clip(lower=0) + (((base["FİYAT"] - base["BB_UPPER"]) / base["FİYAT"]) * 100.0 * 5.0).clip(lower=0)
         base["EDGE"] = np.where(base["RAW"] >= 50, long_edge, short_edge)
 
-        longs = base[base["YÖN"] == "LONG"].copy()
-        shorts = base[base["YÖN"] == "SHORT"].copy()
+        longs = base[base["YÖN"] == "LONG"].copy().sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).head(FALLBACK_LONG)
+        shorts = base[base["YÖN"] == "SHORT"].copy().sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).head(FALLBACK_SHORT)
 
-        if USE_BTC_ETH_REGIME_GATE and allow_dir in ("LONG", "SHORT"):
-            if allow_dir == "LONG":
-                near = longs.sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).head(20)
-            else:
-                near = shorts.sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).head(20)
-        else:
-            longs = longs.sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).head(FALLBACK_LONG)
-            shorts = shorts.sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).head(FALLBACK_SHORT)
-            near = pd.concat([longs, shorts], ignore_index=True)
-
+        near = pd.concat([longs, shorts], ignore_index=True)
         near = near.sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).reset_index(drop=True)
+
         cols = ["COIN", "YÖN", "SKOR", "FİYAT", "RAW", "QV_24H"]
         near = near.loc[:, [c for c in cols if c in near.columns]]
 
-        safe_dataframe(style_table(near), height=600)
+        safe_dataframe(style_table(near), height=620)
