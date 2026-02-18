@@ -24,7 +24,7 @@ IST_TZ = ZoneInfo("Europe/Istanbul")
 BASE_TF = "15m"
 BASE_LIMIT = 220
 
-# Scan all USDT spot pairs (KuCoin returns manageable count)
+# Scan all USDT spot pairs
 HARD_MAX_SYMBOLS = 99999
 
 # Score engine
@@ -33,7 +33,7 @@ BB_PERIOD = 20
 BB_STD = 2.0
 SMA_PERIOD = 20
 
-# PRO regime filters (BTC/ETH + asset trend strength)
+# PRO regime filters
 EMA_FAST = 50
 EMA_SLOW = 200
 ADX_PERIOD = 14
@@ -42,19 +42,19 @@ ADX_PERIOD = 14
 STRONG_LONG_MIN = 90
 STRONG_SHORT_MAX = 10
 
-# Fallback balance (STRONG yoksa)
+# Fallback balance
 FALLBACK_LONG = 10
 FALLBACK_SHORT = 10
 
 # Auto refresh
 AUTO_REFRESH_SEC = 240  # 4 dk
 
-# HARD MODE (keep it strict, but never empty the table)
+# HARD MODE
 PRO_MODE = True
 
 # Spread filter (finalists only)
 REQUIRE_SPREAD = True
-MAX_SPREAD_PCT = 0.55  # biraz gevşettim, yoksa çok eleme oluyor
+MAX_SPREAD_PCT = 0.55
 
 # Asset trend strength on 1h/4h
 REQUIRE_REGIME_1H = True
@@ -65,10 +65,10 @@ REQUIRE_ADX_4H = True
 ADX1_MIN = 22.0
 ADX4_MIN = 20.0
 
-# 2-candle confirmation (avoid fake touches)
+# 2-candle confirmation
 REQUIRE_2CANDLE_CONFIRM = True
 
-# BTC/ETH regime gate: only "bias" the direction, do NOT zero-out table in neutral
+# BTC/ETH regime bias (never empties table)
 USE_BTC_ETH_REGIME_GATE = True
 REGIME_TF_1 = "1h"
 REGIME_TF_2 = "4h"
@@ -207,7 +207,6 @@ def load_usdt_spot_symbols() -> list[str]:
     ex = make_exchange()
     markets = ex.load_markets()
     syms: list[str] = []
-
     for sym, m in markets.items():
         if not m:
             continue
@@ -218,7 +217,6 @@ def load_usdt_spot_symbols() -> list[str]:
         if m.get("quote") != "USDT":
             continue
         syms.append(sym)
-
     return sorted(set(syms))
 
 
@@ -376,7 +374,6 @@ def regime_for_symbol(ex: ccxt.Exchange, symbol: str) -> str:
 
 
 def btc_eth_bias(btc_reg: str, eth_reg: str) -> tuple[str, str]:
-    # Bias only, never "NO TRADE"
     if btc_reg == "BULL" and eth_reg == "BULL":
         return "LONG", "BTC & ETH BULL"
     if btc_reg == "BEAR" and eth_reg == "BEAR":
@@ -472,8 +469,7 @@ def style_table(df: pd.DataFrame):
             return "background-color: #0f3d0f; color: #ffffff; font-weight: 800;"
         return "background-color: #111827; color: #e5e7eb;"
 
-    fmt = {"FİYAT": "{:.4f}", "SKOR": "{:.0f}", "RAW": "{:.0f}", "QV_24H": "{:,.0f}", "SPREAD%": "{:.2f}", "ADX_1H": "{:.1f}", "ADX_4H": "{:.1f}"}
-
+    fmt = {"FİYAT": "{:.4f}", "SKOR": "{:.0f}", "RAW": "{:.0f}", "QV_24H": "{:,.0f}"}
     return (
         df.style.format(fmt)
         .applymap(dir_style, subset=["YÖN"])
@@ -483,9 +479,10 @@ def style_table(df: pd.DataFrame):
 
 
 # =============================
-# Streamlit UI (no sidebar)
+# UI (no sidebar) + BIG LOADING PANEL
 # =============================
 st.set_page_config(page_title="KuCoin PRO Sniper — Simple", layout="wide")
+
 st.markdown(
     """
 <style>
@@ -493,6 +490,26 @@ html, body, [class*="css"]  { background-color: #0b0f14 !important; }
 .block-container { padding-top: 1.0rem; }
 h1, h2, h3, h4, h5, h6, p, span, div { color: #e6edf3; }
 [data-testid="stHeader"] { background: rgba(0,0,0,0); }
+
+.loading-card{
+  border: 1px solid #1f2a37;
+  background: #0f172a;
+  padding: 14px 14px;
+  border-radius: 14px;
+  display:flex;
+  align-items:center;
+  gap: 12px;
+}
+.spinner{
+  width: 22px; height:22px;
+  border: 3px solid rgba(255,255,255,0.18);
+  border-top: 3px solid rgba(255,255,255,0.85);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+.small-muted{ opacity:0.8; font-size: 12px; }
+.big{ font-size: 16px; font-weight: 800; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -520,23 +537,59 @@ with right:
         unsafe_allow_html=True,
     )
 
+loading_box = st.empty()
+progress = st.progress(0, text="Hazırlanıyor…")
+status = st.empty()
 
-@st.cache_data(show_spinner=False, ttl=AUTO_REFRESH_SEC)
-def run_scan() -> dict:
+
+def show_loading(title: str, subtitle: str):
+    loading_box.markdown(
+        f"""
+<div class="loading-card">
+  <div class="spinner"></div>
+  <div>
+    <div class="big">{title}</div>
+    <div class="small-muted">{subtitle}</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def hide_loading():
+    loading_box.empty()
+    status.empty()
+    progress.empty()
+
+
+def run_scan_with_progress() -> dict:
     ex = make_exchange()
 
-    btc_reg = regime_for_symbol(ex, "BTC/USDT") if USE_BTC_ETH_REGIME_GATE else "NA"
-    eth_reg = regime_for_symbol(ex, "ETH/USDT") if USE_BTC_ETH_REGIME_GATE else "NA"
-    bias, bias_msg = btc_eth_bias(btc_reg, eth_reg) if USE_BTC_ETH_REGIME_GATE else ("BOTH", "Regime gate disabled")
+    show_loading("Taranıyor…", "KuCoin USDT Spot evreni hazırlanıyor (tickers + OHLCV).")
+    progress.progress(1, text="Piyasalar yükleniyor…")
+
+    # Regime
+    if USE_BTC_ETH_REGIME_GATE:
+        progress.progress(3, text="BTC/ETH rejimi hesaplanıyor…")
+        btc_reg = regime_for_symbol(ex, "BTC/USDT")
+        eth_reg = regime_for_symbol(ex, "ETH/USDT")
+        bias, bias_msg = btc_eth_bias(btc_reg, eth_reg)
+    else:
+        btc_reg, eth_reg, bias, bias_msg = "NA", "NA", "BOTH", "Regime gate disabled"
 
     syms = load_usdt_spot_symbols()
     universe = syms[: min(len(syms), HARD_MAX_SYMBOLS)]
 
+    progress.progress(6, text="Ticker verileri çekiliyor…")
     tickers = safe_fetch_tickers_all(ex)
     qv_map = {s: quote_volume_usdt(tickers.get(s)) for s in universe} if isinstance(tickers, dict) else {s: 0.0 for s in universe}
 
+    # Stage 1: base scan
     rows = []
-    for symbol in universe:
+    total = max(1, len(universe))
+    show_loading("Taranıyor…", f"OHLCV çekiliyor • Evren: {len(universe)} coin • TF: {BASE_TF}")
+    for i, symbol in enumerate(universe, start=1):
         try:
             o = safe_fetch_ohlcv(ex, symbol, BASE_TF, BASE_LIMIT)
             if not o:
@@ -547,14 +600,24 @@ def run_scan() -> dict:
             r["QV_24H"] = float(qv_map.get(symbol, 0.0))
             rows.append(r)
         except Exception:
-            continue
+            pass
+
+        # progress update (smooth)
+        if i % 10 == 0 or i == total:
+            pct = 6 + int((i / total) * 62)  # 6..68
+            progress.progress(min(68, pct), text=f"OHLCV taranıyor… {i}/{total}")
+
         time.sleep(0.006)
 
     df_all = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # Apply bias only (never empty)
+    # Bias only
     if not df_all.empty and bias in ("LONG", "SHORT"):
         df_all = df_all[df_all["YÖN"] == bias].copy()
+
+    # Stage 2: strong + pro pass (only candidates)
+    progress.progress(72, text="STRONG adayları ayıklanıyor…")
+    show_loading("Analiz…", "STRONG adaylar için PRO filtreler (spread + 1h/4h trend/ADX) kontrol ediliyor.")
 
     strong = pd.DataFrame()
     if not df_all.empty:
@@ -566,7 +629,8 @@ def run_scan() -> dict:
         if PRO_MODE and not cand.empty:
             kept = []
             info_map = {}
-            for row in cand.itertuples(index=False):
+            ctotal = len(cand)
+            for j, row in enumerate(cand.itertuples(index=False), start=1):
                 symbol = getattr(row, "SYMBOL")
                 raw = int(getattr(row, "RAW"))
                 want_dir = "LONG" if raw >= 50 else "SHORT"
@@ -574,6 +638,11 @@ def run_scan() -> dict:
                 if ok:
                     kept.append(symbol)
                     info_map[symbol] = info
+
+                if j % 5 == 0 or j == ctotal:
+                    pct = 72 + int((j / max(1, ctotal)) * 23)  # 72..95
+                    progress.progress(min(95, pct), text=f"PRO filtre… {j}/{ctotal}")
+
                 time.sleep(0.006)
 
             if kept:
@@ -581,15 +650,26 @@ def run_scan() -> dict:
                 strong["SPREAD%"] = strong["SYMBOL"].map(lambda s: info_map.get(s, {}).get("SPREAD%", np.nan))
                 strong["ADX_1H"] = strong["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_1H", np.nan))
                 strong["ADX_4H"] = strong["SYMBOL"].map(lambda s: info_map.get(s, {}).get("ADX_4H", np.nan))
-
         else:
             strong = cand.copy()
 
-    return {"all": df_all, "strong": strong, "regime": {"btc": btc_reg, "eth": eth_reg, "bias": bias, "msg": bias_msg}, "universe_count": int(len(universe)), "all_count": int(len(df_all)) if isinstance(df_all, pd.DataFrame) else 0}
+    progress.progress(100, text="Tamamlandı ✅")
+    time.sleep(0.2)
+
+    return {
+        "all": df_all,
+        "strong": strong,
+        "regime": {"btc": btc_reg, "eth": eth_reg, "bias": bias, "msg": bias_msg},
+        "universe_count": int(len(universe)),
+        "all_count": int(len(df_all)) if isinstance(df_all, pd.DataFrame) else 0,
+        "ts": datetime.now(IST_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
-with st.spinner("Taranıyor…"):
-    res = run_scan()
+try:
+    res = run_scan_with_progress()
+finally:
+    hide_loading()
 
 reg = res.get("regime", {})
 bias = reg.get("bias", "BOTH")
@@ -603,7 +683,7 @@ if USE_BTC_ETH_REGIME_GATE:
     else:
         st.warning(f"⚠️ REGIME: NEUTRAL • {msg} (tablo yine dolu gelir)")
 
-st.caption(f"Evren (USDT spot): {res.get('universe_count', 0)} • Aday (bias sonrası): {res.get('all_count', 0)}")
+st.caption(f"Son tarama: {res.get('ts','—')} • Evren (USDT spot): {res.get('universe_count', 0)} • Aday (bias sonrası): {res.get('all_count', 0)}")
 
 st.subheader("🎯 SNIPER TABLO")
 
@@ -614,7 +694,7 @@ if isinstance(df_strong, pd.DataFrame) and not df_strong.empty:
     show = df_strong.copy()
     show = show.sort_values(["SKOR", "RAW", "QV_24H"], ascending=[False, False, False]).head(20).reset_index(drop=True)
 
-    cols = ["COIN", "YÖN", "SKOR", "FİYAT", "RAW", "QV_24H"]
+    cols = ["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H"]
     for extra in ["SPREAD%", "ADX_1H", "ADX_4H"]:
         if extra in show.columns:
             cols.append(extra)
@@ -630,25 +710,37 @@ else:
     else:
         base = df_all.copy()
 
-        # distance to strong boundary
         base["DIST_STRONG"] = np.where(
             base["RAW"] >= 50,
             (STRONG_LONG_MIN - base["RAW"]).clip(lower=0),
             (base["RAW"] - STRONG_SHORT_MAX).clip(lower=0),
         )
 
-        # edge: how much beyond RSI/BB thresholds
-        long_edge = (35.0 - base["RSI14"]).clip(lower=0) + (((base["BB_LOWER"] - base["FİYAT"]) / base["FİYAT"]) * 100.0 * 5.0).clip(lower=0)
-        short_edge = (base["RSI14"] - 65.0).clip(lower=0) + (((base["FİYAT"] - base["BB_UPPER"]) / base["FİYAT"]) * 100.0 * 5.0).clip(lower=0)
+        long_edge = (35.0 - base["RSI14"]).clip(lower=0) + (
+            ((base["BB_LOWER"] - base["FİYAT"]) / base["FİYAT"]) * 100.0 * 5.0
+        ).clip(lower=0)
+        short_edge = (base["RSI14"] - 65.0).clip(lower=0) + (
+            ((base["FİYAT"] - base["BB_UPPER"]) / base["FİYAT"]) * 100.0 * 5.0
+        ).clip(lower=0)
         base["EDGE"] = np.where(base["RAW"] >= 50, long_edge, short_edge)
 
-        longs = base[base["YÖN"] == "LONG"].copy().sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).head(FALLBACK_LONG)
-        shorts = base[base["YÖN"] == "SHORT"].copy().sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).head(FALLBACK_SHORT)
+        longs = (
+            base[base["YÖN"] == "LONG"]
+            .copy()
+            .sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False])
+            .head(FALLBACK_LONG)
+        )
+        shorts = (
+            base[base["YÖN"] == "SHORT"]
+            .copy()
+            .sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False])
+            .head(FALLBACK_SHORT)
+        )
 
         near = pd.concat([longs, shorts], ignore_index=True)
         near = near.sort_values(["DIST_STRONG", "EDGE", "QV_24H"], ascending=[True, False, False]).reset_index(drop=True)
 
-        cols = ["COIN", "YÖN", "SKOR", "FİYAT", "RAW", "QV_24H"]
+        cols = ["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H"]
         near = near.loc[:, [c for c in cols if c in near.columns]]
 
         safe_dataframe(style_table(near), height=620)
