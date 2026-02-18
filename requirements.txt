@@ -2,3 +2,4 @@ streamlit
 pandas
 numpy
 ccxt
+pandas-ta==0.3.14b0
