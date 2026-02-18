@@ -18,7 +18,7 @@ IST_TZ = ZoneInfo("Europe/Istanbul")
 TIMEFRAME = "15m"
 CANDLE_LIMIT = 200
 
-AUTO_REFRESH_SEC = 240  # 4 dk
+AUTO_REFRESH_SEC = 240
 TABLE_SIZE = 20
 
 # STRONG thresholds (senin isteğin)
@@ -26,25 +26,23 @@ STRONG_LONG_MIN = 90
 STRONG_SHORT_MAX = 10
 
 # Evren / hız dengesi
-MAX_SCAN = 900              # pratik limit (KuCoin USDT spot evreninde timeout yememek için)
-MIN_QV_24H_USDT = 50_000.0  # çok illiquid çöpleri temizler (spread/boşluk riski)
-SLEEP_BETWEEN_REQ = 0.03    # rate-limit dostu
+MAX_SCAN = 450               # 900 yerine 450 (stabil + hızlı, senin ekranda da 425-450 görünüyor)
+MIN_QV_24H_USDT = 50_000.0   # illiquid çöpleri temizler
+SLEEP_BETWEEN_REQ = 0.03
 
-# “Skor adımı”
-SCORE_STEP = 5  # 5'er 5'er (daha gerçekçi dağılım)
+# Skor adımı (5'er 5'er)
+SCORE_STEP = 5
 
-# 6 Kapı – Seviye 2 (sniper için “zor ama gerçekçi”)
-ADX_MIN = 18.0            # trend gücü
-ATR_PCT_MIN = 0.45        # hareketlilik (çok sıkışık coinleri ele)
-RSI_LONG_MAX = 35.0       # long için oversold
-RSI_SHORT_MIN = 65.0      # short için overbought
+# 6 Kapı – Seviye 2
+ADX_MIN = 18.0
+ATR_PCT_MIN = 0.45
+RSI_LONG_MAX = 35.0
+RSI_SHORT_MIN = 65.0
+
 
 # ============================================================
 # Indicators (pure pandas/numpy)
 # ============================================================
-def sma(s: pd.Series, p: int) -> pd.Series:
-    return s.rolling(p, min_periods=p).mean()
-
 def ema(s: pd.Series, p: int) -> pd.Series:
     return s.ewm(span=p, adjust=False, min_periods=p).mean()
 
@@ -82,8 +80,8 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
     tr = true_range(high, low, close)
-
     atr_s = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
     plus_di = 100.0 * pd.Series(plus_dm).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr_s
     minus_di = 100.0 * pd.Series(minus_dm).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr_s
 
@@ -98,6 +96,7 @@ def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, sig: int = 9) ->
 
 def round_step(x: float, step: int = 5) -> int:
     return int(step * round(float(x) / step))
+
 
 # ============================================================
 # Exchange helpers
@@ -123,7 +122,6 @@ def load_usdt_spot_symbols() -> list[str]:
     return sorted(set(out))
 
 def safe_fetch_tickers(ex: ccxt.Exchange, symbols: list[str]) -> dict:
-    # KuCoin bazen toplu/tekil fark ediyor. Güvenli yol:
     try:
         return ex.fetch_tickers(symbols)
     except Exception:
@@ -142,7 +140,6 @@ def qv_usdt(t: dict) -> float:
             return float(v)
         except Exception:
             return 0.0
-    # fallback: baseVolume * last
     try:
         bv = float(t.get("baseVolume") or 0.0)
         last = float(t.get("last") or 0.0)
@@ -150,28 +147,18 @@ def qv_usdt(t: dict) -> float:
     except Exception:
         return 0.0
 
-def safe_fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int):
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
 # ============================================================
-# “6 Kapı / Seviye 2” + RAW/Score
+# “6 Kapı / Seviye 2” + RAW
 # ============================================================
-def compute_raw_and_gates(df: pd.DataFrame) -> tuple[float, int, str]:
-    """
-    Returns:
-      raw (0..100 bullishness),
-      gate_count (0..6),
-      direction ("LONG" if raw>=50 else "SHORT")
-    """
+def compute_raw_and_gates(df: pd.DataFrame) -> tuple[float, int]:
     close = df["close"].astype(float)
     high = df["high"].astype(float)
     low = df["low"].astype(float)
-    vol = df["volume"].astype(float)
 
     rsi14 = rsi_wilder(close, 14)
     _, bb_up, bb_low = bollinger(close, 20, 2.0)
 
-    ema20 = ema(close, 20)
     ema50 = ema(close, 50)
     ema200 = ema(close, 200)
 
@@ -184,7 +171,6 @@ def compute_raw_and_gates(df: pd.DataFrame) -> tuple[float, int, str]:
     last_rsi = float(rsi14.iloc[-1])
     last_bb_low = float(bb_low.iloc[-1])
     last_bb_up = float(bb_up.iloc[-1])
-    last_ema20 = float(ema20.iloc[-1])
     last_ema50 = float(ema50.iloc[-1])
     last_ema200 = float(ema200.iloc[-1])
     last_hist = float(hist.iloc[-1])
@@ -192,27 +178,25 @@ def compute_raw_and_gates(df: pd.DataFrame) -> tuple[float, int, str]:
     last_adx = float(adx14.iloc[-1])
     last_atr_pct = float(atr_pct.iloc[-1])
 
-    if any(np.isnan([last_rsi, last_bb_low, last_bb_up, last_ema20, last_ema50, last_ema200, last_hist, prev_hist, last_adx, last_atr_pct])):
-        return 50.0, 0, "LONG"
+    if any(np.isnan([last_rsi, last_bb_low, last_bb_up, last_ema50, last_ema200, last_hist, prev_hist, last_adx, last_atr_pct])):
+        return 50.0, 0
 
-    # ------------------------
-    # RAW (bullishness) 0..100
-    # ------------------------
+    # RAW bullishness 0..100
     raw = 50.0
 
-    # Trend bias (ema50 vs ema200)
-    if last_ema50 > last_ema200:
+    trend_up = last_ema50 > last_ema200
+    trend_dn = last_ema50 < last_ema200
+
+    if trend_up:
         raw += 10
-    elif last_ema50 < last_ema200:
+    elif trend_dn:
         raw -= 10
 
-    # Pullback / extension via BB
     if last <= last_bb_low:
         raw += 15
     elif last >= last_bb_up:
         raw -= 15
 
-    # RSI extremes (sniper)
     if last_rsi <= 30:
         raw += 15
     elif last_rsi <= RSI_LONG_MAX:
@@ -222,213 +206,172 @@ def compute_raw_and_gates(df: pd.DataFrame) -> tuple[float, int, str]:
     elif last_rsi >= RSI_SHORT_MIN:
         raw -= 10
 
-    # MACD histogram slope (micro reversal)
     if last_hist > prev_hist:
         raw += 5
     else:
         raw -= 5
 
-    # ADX confirms trend strength (align with trend)
     if last_adx >= ADX_MIN:
-        if last_ema50 > last_ema200:
-            raw += 5
-        elif last_ema50 < last_ema200:
-            raw -= 5
+        raw += 5 if trend_up else (-5 if trend_dn else 0)
 
-    # ATR%: very low movement => pull to neutral (avoid fake 100/0)
     if last_atr_pct < ATR_PCT_MIN:
-        raw = 50 + (raw - 50) * 0.35  # soften extremes
+        raw = 50 + (raw - 50) * 0.35
 
     raw = float(np.clip(raw, 0, 100))
-    direction = "LONG" if raw >= 50 else "SHORT"
+    direction_long = raw >= 50
 
-    # ------------------------
-    # 6 Kapı (Seviye 2)
-    # ------------------------
+    # 6 Kapı
     gates = 0
 
-    # Gate 1: Trend regime alignment
-    trend_up = last_ema50 > last_ema200
-    trend_dn = last_ema50 < last_ema200
-    if (direction == "LONG" and trend_up) or (direction == "SHORT" and trend_dn):
+    # Gate1 trend align
+    if (direction_long and trend_up) or ((not direction_long) and trend_dn):
         gates += 1
-
-    # Gate 2: ADX strength
+    # Gate2 ADX
     if last_adx >= ADX_MIN:
         gates += 1
-
-    # Gate 3: ATR% enough movement
+    # Gate3 ATR%
     if last_atr_pct >= ATR_PCT_MIN:
         gates += 1
-
-    # Gate 4: Pullback to BB extreme (sniper entry zone)
-    if direction == "LONG" and last <= last_bb_low:
+    # Gate4 BB extreme
+    if direction_long and last <= last_bb_low:
         gates += 1
-    if direction == "SHORT" and last >= last_bb_up:
+    if (not direction_long) and last >= last_bb_up:
         gates += 1
-
-    # Gate 5: RSI extreme in the correct side
-    if direction == "LONG" and last_rsi <= RSI_LONG_MAX:
+    # Gate5 RSI extreme
+    if direction_long and last_rsi <= RSI_LONG_MAX:
         gates += 1
-    if direction == "SHORT" and last_rsi >= RSI_SHORT_MIN:
+    if (not direction_long) and last_rsi >= RSI_SHORT_MIN:
         gates += 1
-
-    # Gate 6: MACD histogram turns toward reversal
-    if direction == "LONG" and last_hist > prev_hist:
+    # Gate6 MACD turn
+    if direction_long and last_hist > prev_hist:
         gates += 1
-    if direction == "SHORT" and last_hist < prev_hist:
+    if (not direction_long) and last_hist < prev_hist:
         gates += 1
 
-    return raw, int(gates), direction
+    return raw, int(gates)
+
 
 # ============================================================
-# Table selection logic
+# Table logic
 # ============================================================
 def build_table(df_all: pd.DataFrame) -> pd.DataFrame:
-    if df_all.empty:
-        return df_all
-
     df = df_all.copy()
 
-    # Score step quantization
     df["SKOR"] = df["RAW"].apply(lambda x: round_step(x, SCORE_STEP)).astype(int)
-
-    # direction from RAW (simple & consistent)
     df["YÖN"] = np.where(df["RAW"] >= 50, "LONG", "SHORT")
 
-    # STRONG flags (both sides)
     df["IS_STRONG_LONG"] = df["SKOR"] >= STRONG_LONG_MIN
     df["IS_STRONG_SHORT"] = df["SKOR"] <= STRONG_SHORT_MAX
     df["IS_STRONG"] = df["IS_STRONG_LONG"] | df["IS_STRONG_SHORT"]
 
-    # Severity for sorting:
-    # long severity: higher score
-    # short severity: lower score
     df["SEVERITY"] = np.where(df["YÖN"] == "LONG", df["SKOR"], 100 - df["SKOR"])
 
-    # Split
-    strong = df[df["IS_STRONG"]].copy()
-    long_candidates = df[df["YÖN"] == "LONG"].copy()
-    short_candidates = df[df["YÖN"] == "SHORT"].copy()
+    strong = df[df["IS_STRONG"]].sort_values(["SEVERITY", "QV_24H"], ascending=[False, False]).copy()
+    longs = df[df["YÖN"] == "LONG"].sort_values(["SKOR", "QV_24H"], ascending=[False, False]).copy()
+    shorts = df[df["YÖN"] == "SHORT"].sort_values(["SKOR", "QV_24H"], ascending=[True, False]).copy()
 
-    # Sort
-    strong = strong.sort_values(["SEVERITY", "QV_24H"], ascending=[False, False])
-    long_candidates = long_candidates.sort_values(["SKOR", "QV_24H"], ascending=[False, False])
-    short_candidates = short_candidates.sort_values(["SKOR", "QV_24H"], ascending=[True, False])
-
-    # Start table with strong
-    out_rows = []
+    out = []
     used = set()
 
     def push_row(r):
-        k = str(r["COIN"])
-        if k in used:
-            return
-        out_rows.append(r)
-        used.add(k)
+        c = str(r["COIN"])
+        if c in used:
+            return False
+        used.add(c)
+        out.append(r)
+        return True
 
+    # 1) STRONG önce
     for _, r in strong.head(TABLE_SIZE).iterrows():
         push_row(r)
 
-    # Fill remaining with TOP candidates (LONG+SHORT birlikte)
-    remaining = TABLE_SIZE - len(out_rows)
+    # 2) Boş kalırsa TOP ile doldur (LONG/SHORT denge)
+    remaining = TABLE_SIZE - len(out)
     if remaining > 0:
-        # Make balanced fill so SHORT kaybolmasın
-        long_iter = long_candidates.iterrows()
-        short_iter = short_candidates.iterrows()
+        long_iter = longs.iterrows()
+        short_iter = shorts.iterrows()
 
-        # current counts
-        cur_long = sum(1 for x in out_rows if x["YÖN"] == "LONG")
-        cur_short = sum(1 for x in out_rows if x["YÖN"] == "SHORT")
+        cur_long = sum(1 for x in out if x["YÖN"] == "LONG")
+        cur_short = sum(1 for x in out if x["YÖN"] == "SHORT")
 
-        # alternate picking the side that is currently fewer
         while remaining > 0:
             pick_long = (cur_long <= cur_short)
-
             picked = False
+
             if pick_long:
                 for _, r in long_iter:
-                    if str(r["COIN"]) in used:
-                        continue
-                    push_row(r); cur_long += 1; remaining -= 1; picked = True
-                    break
+                    if push_row(r):
+                        cur_long += 1
+                        remaining -= 1
+                        picked = True
+                        break
                 if not picked:
                     for _, r in short_iter:
-                        if str(r["COIN"]) in used:
-                            continue
-                        push_row(r); cur_short += 1; remaining -= 1; picked = True
-                        break
+                        if push_row(r):
+                            cur_short += 1
+                            remaining -= 1
+                            picked = True
+                            break
             else:
                 for _, r in short_iter:
-                    if str(r["COIN"]) in used:
-                        continue
-                    push_row(r); cur_short += 1; remaining -= 1; picked = True
-                    break
+                    if push_row(r):
+                        cur_short += 1
+                        remaining -= 1
+                        picked = True
+                        break
                 if not picked:
                     for _, r in long_iter:
-                        if str(r["COIN"]) in used:
-                            continue
-                        push_row(r); cur_long += 1; remaining -= 1; picked = True
-                        break
+                        if push_row(r):
+                            cur_long += 1
+                            remaining -= 1
+                            picked = True
+                            break
 
             if not picked:
                 break
 
-    out = pd.DataFrame(out_rows)
-    if out.empty:
-        return out
+    out_df = pd.DataFrame(out)
+    if out_df.empty:
+        return out_df
 
-    # Final columns (order)
-    out = out[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI"]].copy()
+    out_df = out_df[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI"]].copy()
 
-    # Sort inside table: STRONG first, then best TOP
-    out["_STR"] = np.where((out["SKOR"] >= STRONG_LONG_MIN) | (out["SKOR"] <= STRONG_SHORT_MAX), 1, 0)
-    out["_SEV"] = np.where(out["YÖN"] == "LONG", out["SKOR"], 100 - out["SKOR"])
-    out = out.sort_values(["_STR", "_SEV", "QV_24H"], ascending=[False, False, False]).drop(columns=["_STR", "_SEV"])
-    out = out.reset_index(drop=True)
-    return out
+    # tabloda STRONG üstte
+    out_df["_STR"] = np.where((out_df["SKOR"] >= STRONG_LONG_MIN) | (out_df["SKOR"] <= STRONG_SHORT_MAX), 1, 0)
+    out_df["_SEV"] = np.where(out_df["YÖN"] == "LONG", out_df["SKOR"], 100 - out_df["SKOR"])
+    out_df = out_df.sort_values(["_STR", "_SEV", "QV_24H"], ascending=[False, False, False]).drop(columns=["_STR", "_SEV"])
+    out_df = out_df.reset_index(drop=True)
+    return out_df
+
 
 # ============================================================
-# Styling (Dark theme + readable table)
+# Styling (Koyu tema, solukluk yok)
 # ============================================================
 def style_table(df: pd.DataFrame):
     def dir_style(v):
         if v == "LONG":
-            return "background-color:#0f3d2e;color:#e6edf3;font-weight:700;"
+            return "background-color:#0f3d2e;color:#ffffff;font-weight:800;"
         if v == "SHORT":
-            return "background-color:#4a1414;color:#e6edf3;font-weight:700;"
+            return "background-color:#4a1414;color:#ffffff;font-weight:800;"
         return ""
 
     def score_style(v):
-        try:
-            v = int(v)
-        except Exception:
-            return ""
+        v = int(v)
         if v >= STRONG_LONG_MIN:
-            return "background-color:#0b5d1e;color:#ffffff;font-weight:800;"
+            return "background-color:#0b5d1e;color:#ffffff;font-weight:900;"
         if v <= STRONG_SHORT_MAX:
-            return "background-color:#7a1111;color:#ffffff;font-weight:800;"
-        return "background-color:#0b1220;color:#e6edf3;font-weight:700;"
+            return "background-color:#7a1111;color:#ffffff;font-weight:900;"
+        return "background-color:#0b1220;color:#e6edf3;font-weight:800;"
 
     def raw_style(v):
-        try:
-            v = float(v)
-        except Exception:
-            return ""
-        # show raw intensity subtly
+        v = float(v)
         if v >= 80:
             return "background-color:#083b15;color:#e6edf3;"
         if v <= 20:
             return "background-color:#3b0b0b;color:#e6edf3;"
         return "background-color:#0b1220;color:#e6edf3;"
 
-    fmt = {
-        "FİYAT": "{:.6f}",
-        "RAW": "{:.0f}",
-        "QV_24H": "{:,.0f}",
-        "KAPI": "{:.0f}",
-        "SKOR": "{:.0f}",
-    }
+    fmt = {"FİYAT": "{:.6f}", "RAW": "{:.0f}", "QV_24H": "{:,.0f}", "KAPI": "{:.0f}", "SKOR": "{:.0f}"}
 
     return (
         df.style
@@ -443,26 +386,30 @@ def style_table(df: pd.DataFrame):
             "font-size": "14px",
         })
         .set_table_styles([
-            {"selector": "th", "props": [("background-color", "#0b0f14"), ("color", "#e6edf3"), ("border-color", "#1f2a37"), ("font-weight", "800")]},
+            {"selector": "th", "props": [("background-color", "#0b0f14"), ("color", "#e6edf3"), ("border-color", "#1f2a37"), ("font-weight", "900")]},
             {"selector": "td", "props": [("border-color", "#1f2a37")]},
             {"selector": "table", "props": [("border-collapse", "collapse")]},
         ])
     )
+
 
 # ============================================================
 # Streamlit page
 # ============================================================
 st.set_page_config(page_title="KuCoin PRO Sniper — Auto (LONG+SHORT)", layout="wide")
 
+# Koyu tema (solukluk kilidi)
 st.markdown(
     """
 <style>
-html, body, [class*="css"]  { background-color: #0b0f14 !important; }
+:root { color-scheme: dark !important; }
+html, body { background:#0b0f14 !important; }
+.stApp { background:#0b0f14 !important; color:#e6edf3 !important; opacity:1 !important; }
 .block-container { padding-top: 1.0rem; }
-h1, h2, h3, h4, h5, h6, p, span, div { color: #e6edf3 !important; }
 [data-testid="stHeader"] { background: rgba(0,0,0,0) !important; }
 [data-testid="stToolbar"] { display:none; }
-a { color: #93c5fd !important; }
+h1,h2,h3,h4,h5,h6,p,span,div,label { color:#e6edf3 !important; opacity:1 !important; }
+section.main { background:#0b0f14 !important; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -477,18 +424,36 @@ except Exception:
     except Exception:
         pass
 
-# Header
+def card(text: str, bg: str, border: str):
+    st.markdown(
+        f"""
+<div style="
+background:{bg};
+border:1px solid {border};
+border-radius:14px;
+padding:14px 16px;
+font-weight:800;
+color:#e6edf3;
+">
+{text}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
 now_ist = datetime.now(IST_TZ)
 st.markdown(
     f"""
 <div style="display:flex;align-items:flex-start;justify-content:space-between;">
   <div>
-    <div style="font-size:32px;font-weight:900;letter-spacing:0.2px;">🎯 KuCoin PRO Sniper — Auto (LONG + SHORT)</div>
-    <div style="opacity:0.85;margin-top:6px;">TF={TIMEFRAME} • STRONG: SKOR≥{STRONG_LONG_MIN} (LONG) / SKOR≤{STRONG_SHORT_MAX} (SHORT) • 6 Kapı • Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s</div>
+    <div style="font-size:30px;font-weight:950;letter-spacing:0.2px;">🎯 KuCoin PRO Sniper — Auto (LONG + SHORT)</div>
+    <div style="opacity:0.95;margin-top:6px;">
+      TF={TIMEFRAME} • STRONG: SKOR≥{STRONG_LONG_MIN} (LONG) / SKOR≤{STRONG_SHORT_MAX} (SHORT) • 6 Kapı • Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s
+    </div>
   </div>
-  <div style="text-align:right;opacity:0.9;">
+  <div style="text-align:right;opacity:0.95;">
     <div style="font-size:12px;">Istanbul Time</div>
-    <div style="font-size:18px;font-weight:800;">{now_ist.strftime('%Y-%m-%d %H:%M:%S')}</div>
+    <div style="font-size:18px;font-weight:900;">{now_ist.strftime('%Y-%m-%d %H:%M:%S')}</div>
   </div>
 </div>
 """,
@@ -497,7 +462,7 @@ st.markdown(
 
 st.write("")
 
-# Scan universe
+# Scan
 ex = make_exchange()
 
 with st.spinner("⏳ KuCoin USDT spot evreni taranıyor... (lütfen bekle)"):
@@ -506,32 +471,34 @@ with st.spinner("⏳ KuCoin USDT spot evreni taranıyor... (lütfen bekle)"):
     tickers = safe_fetch_tickers(ex, symbols)
     rows_rank = []
     for s in symbols:
-        t = tickers.get(s)
-        qv = qv_usdt(t)
+        qv = qv_usdt(tickers.get(s))
         if qv >= MIN_QV_24H_USDT:
             rows_rank.append((s, qv))
     rows_rank.sort(key=lambda x: x[1], reverse=True)
 
-    # Scan list (liquidity filtered then capped for stability)
     scan_list = [s for s, _ in rows_rank[:MAX_SCAN]]
 
-    st.info(f"🧠 Evren (USDT spot): {len(symbols)} • Likidite filtresi sonrası: {len(rows_rank)} • Tarama: {len(scan_list)}")
+    card(f"🧠 Evren (USDT spot): {len(symbols)} • Likidite filtresi sonrası: {len(rows_rank)} • Tarama: {len(scan_list)}", "#0b1a2a", "#1f3a5f")
 
     prog = st.progress(0, text="Scanning...")
     out_rows = []
 
     total = max(1, len(scan_list))
+    qv_map = dict(rows_rank)
+
     for i, sym in enumerate(scan_list, start=1):
         try:
-            ohlcv = safe_fetch_ohlcv(ex, sym, TIMEFRAME, CANDLE_LIMIT)
-            if not ohlcv or len(ohlcv) < 210:
+            ohlcv = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+
+            # ✅ BUG FIX: limit=200 iken 210 kontrolü yüzünden hepsi düşüyordu.
+            if not ohlcv or len(ohlcv) < CANDLE_LIMIT:
                 continue
 
             df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-            raw, gates, direction = compute_raw_and_gates(df)
 
+            raw, gates = compute_raw_and_gates(df)
             last_price = float(df["close"].iloc[-1])
-            qv24 = float(dict(rows_rank).get(sym, 0.0))
+            qv24 = float(qv_map.get(sym, 0.0))
 
             out_rows.append({
                 "COIN": sym.split("/")[0],
@@ -541,9 +508,7 @@ with st.spinner("⏳ KuCoin USDT spot evreni taranıyor... (lütfen bekle)"):
                 "QV_24H": qv24,
             })
 
-        except (ccxt.RequestTimeout, ccxt.NetworkError):
-            pass
-        except ccxt.ExchangeError:
+        except (ccxt.RequestTimeout, ccxt.NetworkError, ccxt.ExchangeError):
             pass
         except Exception:
             pass
@@ -560,15 +525,14 @@ st.write("")
 st.markdown("## 🎯 SNIPER TABLO")
 
 if df_all.empty:
-    st.warning("Aday yok (network/KuCoin veya filtre çok sert). Bir sonraki auto refresh’i bekle.")
+    card("⚠️ Aday yok (network/KuCoin veya filtre çok sert). Bir sonraki auto refresh’i bekle.", "#2a1b0b", "#5f3a1f")
 else:
     table = build_table(df_all)
 
-    # Status banner
     strong_count = int(((table["SKOR"] >= STRONG_LONG_MIN) | (table["SKOR"] <= STRONG_SHORT_MAX)).sum())
     if strong_count > 0:
-        st.success("✅ STRONG bulundu. Kalan boşluklar TOP adaylarla dolduruldu.")
+        card("✅ STRONG bulundu. Kalan boşluklar TOP adaylarla dolduruldu.", "#0f2a19", "#1f5f3a")
     else:
-        st.warning("⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu (LONG+SHORT birlikte).")
+        card("⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu (LONG+SHORT birlikte).", "#2a1b0b", "#5f3a1f")
 
     st.dataframe(style_table(table), use_container_width=True, height=720)
