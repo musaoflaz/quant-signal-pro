@@ -1,539 +1,623 @@
-# app.py
-# KuCoin PRO Sniper — Auto (LONG + SHORT)
-# Baseline: koyu tema • skor adımı 5 • LONG/SHORT renklendirme • STRONG + TOP doldurma
-# Not: pandas_ta KULLANMIYOR (requirements derdi çıkmasın)
-
 import time
-import requests
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
-import streamlit.components.v1 as components
-from datetime import datetime, timezone, timedelta
 
-# ----------------------------
-# SABİTLER (SIDEBAR YOK)
-# ----------------------------
+# =========================================================
+# BASELINE AYARLAR (SIDEBAR YOK - kullanıcı ayarı yok)
+# =========================================================
 TF = "15min"
 CANDLE_LIMIT = 200
+AUTO_REFRESH_SEC = 240
 
-MAX_SYMBOLS = 450              # pratik limit (KuCoin USDT evreninden hacme göre)
-REFRESH_SEC = 240              # auto refresh
-VOLVALUE_MIN = 20_000          # 24h quote volume altı elenir (illiquid azaltır)
-
-# STRONG eşikleri (RAW üzerinden)
+# STRONG eşikleri (SENİN İSTEDİĞİN)
 STRONG_LONG_RAW = 90
 STRONG_SHORT_RAW = 10
 
-# GATE seviyesi (Level-2): STRONG için 6/6 şart, fallback için >=2 yeter
-STRONG_GATES_REQUIRED = 6
-FALLBACK_MIN_GATES = 2
-
-# Skor adımı
+# Skor step (5'lik adım)
 SCORE_STEP = 5
 
-# ----------------------------
-# STREAMLIT SAYFA AYARI
-# ----------------------------
+# Tablo kalabalık olmasın (10/10 estetik)
+N_LONG = 10
+N_SHORT = 10
+N_TOTAL = N_LONG + N_SHORT
+
+# Likidite / spread filtreleri (çok sert değil, ama çöpleri eleyelim)
+MIN_QV_24H = 50_000        # quote volume (USDT) altını ele
+MAX_SPREAD_PCT = 0.40      # %0.40 üstü spread ele (illiquid)
+
+# Tarama üst limiti (performans için)
+MAX_SCAN = 450
+
+# =========================================================
+# STREAMLIT PAGE
+# =========================================================
 st.set_page_config(page_title="KuCoin PRO Sniper", layout="wide")
 
-# Auto refresh (ekstra paket yok, JS ile)
-components.html(
-    f"""
-    <script>
-      setTimeout(function() {{
-        window.location.reload();
-      }}, {REFRESH_SEC*1000});
-    </script>
-    """,
-    height=0,
-)
-
-# Koyu tema + okunurluk (şeffaflık/white sorunu için)
+# =========================================================
+# DARK THEME CSS (ŞEFFAFLIK / OKUNMA PROBLEMİNİ ÇÖZER)
+# =========================================================
 st.markdown(
     """
     <style>
-      html, body, [class*="css"] {
-        background-color: #0b0f14 !important;
-        color: #e8eef6 !important;
-      }
+      html, body, [class*="css"]  { background: #0b0f14 !important; }
       .block-container { padding-top: 1.2rem; }
-      h1, h2, h3 { color: #e8eef6 !important; }
-      .sniper-sub { color: #9fb0c3; margin-top: -10px; }
-      /* Kartlar */
+      h1, h2, h3, h4, h5, h6, p, span, div { color: #e7edf5 !important; }
+      .stAlert > div { background: #0f1722 !important; color: #e7edf5 !important; border-radius: 14px !important; }
       .sniper-card {
-        background: #0f1722;
-        border: 1px solid #1f2a3a;
-        border-radius: 14px;
-        padding: 14px 16px;
+        background:#0f1722; border:1px solid rgba(255,255,255,.08);
+        padding:14px 16px; border-radius:14px; margin-bottom:10px;
       }
-      .sniper-warn {
-        background: #2a2a12;
-        border: 1px solid #444416;
-        border-radius: 14px;
-        padding: 14px 16px;
-      }
-      .sniper-ok {
-        background: #0f2a1a;
-        border: 1px solid #1f5a35;
-        border-radius: 14px;
-        padding: 14px 16px;
-      }
-      /* Dataframe */
-      [data-testid="stDataFrame"] { background: #0b0f14 !important; }
-      .stProgress > div > div > div > div { background-color: #2b7cff !important; }
-      /* Gizli beyaz boşluklar */
-      section.main > div { background-color: #0b0f14 !important; }
+      .muted { color:#a7b3c3 !important; font-size: 0.95rem; }
+      .tiny { color:#9aa6b7 !important; font-size: 0.85rem; }
+      .pill-ok { background:#11351f; border:1px solid rgba(0,255,120,.25); padding:10px 12px; border-radius:14px; }
+      .pill-warn { background:#2a2a10; border:1px solid rgba(255,220,0,.25); padding:10px 12px; border-radius:14px; }
+      .pill-bad { background:#331316; border:1px solid rgba(255,80,80,.25); padding:10px 12px; border-radius:14px; }
     </style>
     """,
-    unsafe_allow_html=True,
-)
-
-# Başlık
-st.markdown("## 🎯 KuCoin PRO Sniper — Auto (LONG + SHORT)")
-st.markdown(
-    f'<div class="sniper-sub">TF={TF} • STRONG: SKOR≥{STRONG_LONG_RAW} (LONG) / SKOR≤{STRONG_SHORT_RAW} (SHORT) • 6 Kapı • Skor adımı: {SCORE_STEP} • Auto: {REFRESH_SEC}s</div>',
     unsafe_allow_html=True
 )
 
-IST = timezone(timedelta(hours=3))
-now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-st.markdown(f"<div class='sniper-sub'>İstanbul Time: {now_ist}</div>", unsafe_allow_html=True)
+# =========================================================
+# KUCOIN ENDPOINTS
+# =========================================================
+KUCOIN = "https://api.kucoin.com"
 
-# ----------------------------
-# YARDIMCI: SAYISAL İNDİKATÖRLER (pandas_ta yok)
-# ----------------------------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
 
-def rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = ma_up / (ma_down.replace(0, np.nan))
-    out = 100 - (100 / (1 + rs))
-    return out.fillna(50)
-
-def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    tr = true_range(high, low, close)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
-
-def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr = true_range(high, low, close)
-    atr_s = tr.ewm(alpha=1/period, adjust=False).mean()
-
-    plus_di = 100 * pd.Series(plus_dm, index=high.index).ewm(alpha=1/period, adjust=False).mean() / (atr_s.replace(0, np.nan))
-    minus_di = 100 * pd.Series(minus_dm, index=high.index).ewm(alpha=1/period, adjust=False).mean() / (atr_s.replace(0, np.nan))
-
-    dx = (100 * (plus_di - minus_di).abs() / ((plus_di + minus_di).replace(0, np.nan))).fillna(0)
-    adx_v = dx.ewm(alpha=1/period, adjust=False).mean()
-    return adx_v.fillna(0)
-
-def macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
-    macd_line = ema(close, fast) - ema(close, slow)
-    signal_line = ema(macd_line, signal)
-    return (macd_line - signal_line).fillna(0)
-
-def round_to_step(x: float, step: int) -> int:
-    return int(round(x / step) * step)
-
-def safe_float(x, default=0.0):
+def _safe_float(x, default=np.nan):
     try:
         return float(x)
     except Exception:
         return default
 
-# ----------------------------
-# KUCOIN API
-# ----------------------------
-KUCOIN = "https://api.kucoin.com"
 
-@st.cache_data(ttl=REFRESH_SEC, show_spinner=False)
-def fetch_all_tickers():
-    url = f"{KUCOIN}/api/v1/market/allTickers"
-    r = requests.get(url, timeout=20)
+def now_istanbul_str():
+    # İstanbul UTC+3 (sabit)
+    utc_now = datetime.now(timezone.utc)
+    ist = utc_now.astimezone(timezone.utc).replace(hour=(utc_now.hour + 3) % 24)
+    # Basit gösterim (Streamlit için yeterli)
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+@st.cache_data(ttl=60)
+def get_all_tickers():
+    r = requests.get(f"{KUCOIN}/api/v1/market/allTickers", timeout=15)
     r.raise_for_status()
     data = r.json()["data"]["ticker"]
     df = pd.DataFrame(data)
-    return df
 
-@st.cache_data(ttl=REFRESH_SEC, show_spinner=False)
-def fetch_candles(symbol: str, tf: str = TF, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
-    url = f"{KUCOIN}/api/v1/market/candles"
+    # Symbol format: "TRX-USDT"
+    df = df[df["symbol"].str.endswith("-USDT")].copy()
+
+    # numeric
+    df["buy"] = df["buy"].map(_safe_float)
+    df["sell"] = df["sell"].map(_safe_float)
+    df["last"] = df["last"].map(_safe_float)
+    df["volValue"] = df["volValue"].map(_safe_float)  # quote volume
+    df["changeRate"] = df["changeRate"].map(_safe_float)
+
+    # spread %
+    df["spread_pct"] = np.where(
+        (df["buy"] > 0) & (df["sell"] > 0),
+        (df["sell"] - df["buy"]) / df["sell"] * 100.0,
+        np.nan
+    )
+
+    # bazı “garip” token isimleri (UP/DOWN/3L/3S vb.) istersen ekleriz; şimdilik dokunmuyoruz
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["last", "volValue"])
+
+    # Likidite + spread filtresi
+    df_f = df[(df["volValue"] >= MIN_QV_24H) & (df["spread_pct"] <= MAX_SPREAD_PCT)].copy()
+
+    # En likitleri tarayalım
+    df_f = df_f.sort_values("volValue", ascending=False).head(MAX_SCAN).reset_index(drop=True)
+    return df, df_f
+
+
+@st.cache_data(ttl=120)
+def get_candles(symbol: str, tf: str = TF, limit: int = CANDLE_LIMIT) -> pd.DataFrame:
+    # KuCoin candles: /api/v1/market/candles?type=15min&symbol=TRX-USDT
     params = {"type": tf, "symbol": symbol}
-    r = requests.get(url, params=params, timeout=20)
+    r = requests.get(f"{KUCOIN}/api/v1/market/candles", params=params, timeout=15)
     r.raise_for_status()
-    arr = r.json()["data"]
-    if not arr:
+    rows = r.json()["data"]
+
+    # rows: [time, open, close, high, low, volume, turnover]
+    if not rows:
         return pd.DataFrame()
-    arr = arr[:limit]
-    df = pd.DataFrame(arr, columns=["time", "open", "close", "high", "low", "volume", "turnover"])
-    df["time"] = pd.to_datetime(df["time"].astype(int), unit="s", utc=True)
+
+    df = pd.DataFrame(rows, columns=["ts", "open", "close", "high", "low", "volume", "turnover"])
+    df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="s")
     for c in ["open", "close", "high", "low", "volume", "turnover"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.sort_values("time").dropna().reset_index(drop=True)
+
+    df = df.sort_values("ts").reset_index(drop=True)
+    if len(df) > limit:
+        df = df.tail(limit).reset_index(drop=True)
     return df
 
-def is_usdt_spot(symbol_name: str) -> bool:
-    return isinstance(symbol_name, str) and symbol_name.endswith("-USDT")
 
-def is_junk(symbol_name: str) -> bool:
-    s = symbol_name.upper()
-    bad = ["UP-", "DOWN-", "3L-", "3S-", "BULL-", "BEAR-"]
-    return any(x in s for x in bad)
+# =========================================================
+# INDICATORS (pandas_ta yok - requirements basit)
+# =========================================================
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
-# ----------------------------
-# BTC/ETH REJİM
-# ----------------------------
-def regime_label() -> tuple[str, str]:
+
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / (avg_loss + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+
+def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+    m = ema(close, fast) - ema(close, slow)
+    s = ema(m, signal)
+    return m - s
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1
+    ).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+
+# =========================================================
+# REGIME (BTC/ETH)
+# =========================================================
+def calc_regime() -> tuple[str, float]:
+    """
+    returns (regime_label, bias_score)
+    bias_score: +1 bullish, -1 bearish, 0 neutral
+    """
     try:
-        btc = fetch_candles("BTC-USDT", TF, 200)
-        eth = fetch_candles("ETH-USDT", TF, 200)
+        btc = get_candles("BTC-USDT", TF, CANDLE_LIMIT)
+        eth = get_candles("ETH-USDT", TF, CANDLE_LIMIT)
         if btc.empty or eth.empty:
-            return ("REGIME: NO TRADE • BTC/ETH data yok", "NO_TRADE")
+            return ("NO TRADE • BTC/ETH unknown", 0.0)
 
-        def calc_bias(df):
-            c = df["close"]
-            e50 = ema(c, 50)
-            e200 = ema(c, 200)
-            r = rsi(c, 14)
-            long_ok = (c.iloc[-1] > e200.iloc[-1]) and (e50.iloc[-1] > e200.iloc[-1]) and (r.iloc[-1] >= 50)
-            short_ok = (c.iloc[-1] < e200.iloc[-1]) and (e50.iloc[-1] < e200.iloc[-1]) and (r.iloc[-1] <= 50)
-            if long_ok and not short_ok:
-                return "LONG"
-            if short_ok and not long_ok:
-                return "SHORT"
-            return "NEUTRAL"
+        def bias_one(x: pd.DataFrame) -> int:
+            c = x["close"]
+            e20 = ema(c, 20).iloc[-1]
+            e50 = ema(c, 50).iloc[-1]
+            r = rsi(c, 14).iloc[-1]
+            # trend + momentum
+            score = 0
+            score += 1 if e20 > e50 else -1
+            score += 1 if r > 52 else (-1 if r < 48 else 0)
+            return score
 
-        b1 = calc_bias(btc)
-        b2 = calc_bias(eth)
+        b_btc = bias_one(btc)
+        b_eth = bias_one(eth)
 
-        if b1 == "LONG" and b2 == "LONG":
-            return ("REGIME: LONG BIAS • BTC/ETH bullish", "LONG")
-        if b1 == "SHORT" and b2 == "SHORT":
-            return ("REGIME: SHORT BIAS • BTC/ETH bearish", "SHORT")
-        return ("REGIME: NEUTRAL • BTC/ETH neutral (bias yok)", "NEUTRAL")
+        total = b_btc + b_eth  # -4..+4
+        if total >= 2:
+            return ("LONG BIAS • BTC/ETH bullish", +1.0)
+        if total <= -2:
+            return ("SHORT BIAS • BTC/ETH bearish", -1.0)
+        return ("NEUTRAL • BTC/ETH neutral (bias yok)", 0.0)
     except Exception:
-        return ("REGIME: NO TRADE • BTC/ETH error", "NO_TRADE")
+        return ("NO TRADE • BTC/ETH error", 0.0)
 
-# ----------------------------
-# 6 KAPI + RAW
-# ----------------------------
-def compute_raw_and_gates(cdf: pd.DataFrame) -> tuple[float, int]:
-    if cdf is None or cdf.empty or len(cdf) < 60:
-        return (50.0, 0)
 
-    close = cdf["close"]
-    high = cdf["high"]
-    low = cdf["low"]
-    vol = cdf["volume"]
+# =========================================================
+# 6 KAPI + RAW(0-100) + SKOR(5'lik)
+# =========================================================
+def compute_signal(symbol: str, qv_24h: float, last_price: float, regime_bias: float) -> dict | None:
+    df = get_candles(symbol, TF, CANDLE_LIMIT)
+    if df.empty or len(df) < 60:
+        return None
 
-    e20 = ema(close, 20)
-    e50 = ema(close, 50)
-    e200 = ema(close, 200)
+    c = df["close"]
+    e20 = ema(c, 20)
+    e50 = ema(c, 50)
+    r = rsi(c, 14)
+    h = macd_hist(c)
+    a = atr(df, 14)
 
-    r = rsi(close, 14)
-    h = macd_hist(close)
-    a = adx(high, low, close, 14)
-    at = atr(high, low, close, 14)
+    close = float(c.iloc[-1])
+    ema20 = float(e20.iloc[-1])
+    ema50 = float(e50.iloc[-1])
+    rsi14 = float(r.iloc[-1])
+    hist = float(h.iloc[-1])
+    atr14 = float(a.iloc[-1])
 
-    last_close = close.iloc[-1]
-    last_rsi = r.iloc[-1]
-    last_hist = h.iloc[-1]
-    last_adx = a.iloc[-1]
-    last_atr_pct = (at.iloc[-1] / last_close) if last_close else 0.0
+    # --- KAPI değerlendirmeleri (bullishness tarafı) ---
+    # Gate1: Trend (EMA20 > EMA50)
+    g1 = 1 if ema20 > ema50 else -1
 
-    gates = []
+    # Gate2: RSI momentum
+    if rsi14 > 55:
+        g2 = 1
+    elif rsi14 < 45:
+        g2 = -1
+    else:
+        g2 = 0
 
-    gate1_long = (last_close > e200.iloc[-1]) and (e50.iloc[-1] > e200.iloc[-1])
-    gate1_short = (last_close < e200.iloc[-1]) and (e50.iloc[-1] < e200.iloc[-1])
-    gates.append(gate1_long or gate1_short)
+    # Gate3: MACD hist
+    if hist > 0:
+        g3 = 1
+    elif hist < 0:
+        g3 = -1
+    else:
+        g3 = 0
 
-    gate2_long = last_rsi >= 55
-    gate2_short = last_rsi <= 45
-    gates.append(gate2_long or gate2_short)
+    # Gate4: 15m "impulse" (son kapanış EMA20’den ne kadar uzak)
+    # ATR bazlı: close > ema20 + 0.35*ATR => bullish, close < ema20 - 0.35*ATR => bearish
+    if atr14 > 0:
+        if close > ema20 + 0.35 * atr14:
+            g4 = 1
+        elif close < ema20 - 0.35 * atr14:
+            g4 = -1
+        else:
+            g4 = 0
+    else:
+        g4 = 0
 
-    gate3_long = last_hist > 0
-    gate3_short = last_hist < 0
-    gates.append(gate3_long or gate3_short)
+    # Gate5: Volatility kalite (ATR% yeterli mi?) => sinyal sertliği için
+    # ATR% çok düşükse (ör. <0.25) “sert sinyal” üretmeyelim: nötrleştirir.
+    atr_pct = (atr14 / close * 100.0) if close > 0 else 0
+    if atr_pct >= 0.60:
+        g5 = 1  # “tradeable volatility”
+    elif atr_pct <= 0.25:
+        g5 = -1  # “ölü piyasa”
+    else:
+        g5 = 0
 
-    gates.append(last_adx >= 18)
+    # Gate6: Regime (BTC/ETH)
+    # +1 bullish, -1 bearish, 0 neutral
+    g6 = 1 if regime_bias > 0 else (-1 if regime_bias < 0 else 0)
 
-    vmean = vol.rolling(20).mean().iloc[-1] if len(vol) >= 20 else vol.mean()
-    gates.append(bool(vmean) and (vol.iloc[-1] >= (vmean * 1.2)))
+    gates = [g1, g2, g3, g4, g5, g6]
 
-    gates.append(0.002 <= last_atr_pct <= 0.08)
+    # --- RAW (bullishness 0..100) ---
+    # Temel: 50. Her gate +/- “puan” ekler.
+    # Sertliği artırmak için (6 kapı) gate ağırlığını biraz yükselttik.
+    raw = 50.0
 
-    gate_pass = int(sum(bool(x) for x in gates))
+    # Gate ağırlıkları (toplam etkisi ~ +/-45)
+    weights = [12, 10, 10, 8, 5, 6]  # toplam 51 ama 0/± ile dengelenir
+    for gi, wi in zip(gates, weights):
+        raw += gi * wi
 
-    rsi_component = (last_rsi - 50) * 1.2
-    trend_component = 0.0
-    if e200.iloc[-1] != 0:
-        trend_component = ((last_close / e200.iloc[-1]) - 1.0) * 400
-    macd_component = np.tanh(last_hist * 5) * 18
-    adx_boost = np.tanh((last_adx - 18) / 10) * 10
-    gate_bonus = (gate_pass - 3) * 3
+    # RSI ince ayar (50 üstü bullish, 50 altı bearish)
+    raw += (rsi14 - 50.0) * 0.35  # ~ +/-17.5 max
 
-    raw_unclipped = 50 + rsi_component + trend_component + macd_component + adx_boost + gate_bonus
-    raw = float(np.clip(raw_unclipped, 0, 100))
-    return (raw, gate_pass)
+    # MACD hist ince ayar (normalize basitçe ATR ile)
+    if atr14 > 0:
+        raw += np.clip(hist / atr14, -2, 2) * 4.0  # +/-8
 
-# ----------------------------
-# STYLING (Base: LONG yeşil, SHORT kırmızı, STRONG daha koyu)
-# ----------------------------
-def style_table(df: pd.DataFrame):
-    LONG_BG = "#0f3b2e"
-    SHORT_BG = "#4a1212"
-    STRONG_LONG_BG = "#0a2a20"
-    STRONG_SHORT_BG = "#2c0a0a"
+    raw = float(np.clip(raw, 0, 100))
 
-    BASE_TEXT = "color: #e8eef6;"
-    BORDER = "border-color: #1f2a3a !important;"
-    HEAD_BG = "#101826"
+    # SKOR 5'lik adım
+    skor = int(round(raw / SCORE_STEP) * SCORE_STEP)
+    skor = int(np.clip(skor, 0, 100))
+
+    # Direction: bullishness >=50 => LONG, else SHORT
+    direction = "LONG" if raw >= 50 else "SHORT"
+
+    # Kapı sayısı (seçilen yön için kaç kapı "uyumlu")
+    # LONG: gate = +1, SHORT: gate = -1
+    if direction == "LONG":
+        kapi = sum(1 for g in gates if g == 1)
+    else:
+        kapi = sum(1 for g in gates if g == -1)
+
+    strong = (direction == "LONG" and raw >= STRONG_LONG_RAW and kapi >= 6) or \
+             (direction == "SHORT" and raw <= STRONG_SHORT_RAW and kapi >= 6)
+
+    return {
+        "YÖN": direction,
+        "COIN": symbol.replace("-USDT", ""),
+        "SKOR": skor,
+        "FİYAT": float(last_price) if last_price else close,
+        "RAW": int(round(raw)),
+        "QV_24H": float(qv_24h),
+        "KAPI": int(kapi),
+        "STRONG": bool(strong),
+    }
+
+
+# =========================================================
+# TABLO SEÇİMİ (STRONG önce, kalan boşluk TOP ile dolar)
+# =========================================================
+def pick_table(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df.empty:
+        return df, df
+
+    strong_df = df[df["STRONG"]].copy()
+
+    # STRONG sıralama: LONG yüksek RAW, SHORT düşük RAW
+    strong_long = strong_df[strong_df["YÖN"] == "LONG"].sort_values(["RAW", "QV_24H"], ascending=[False, False])
+    strong_short = strong_df[strong_df["YÖN"] == "SHORT"].sort_values(["RAW", "QV_24H"], ascending=[True, False])
+
+    strong_ordered = pd.concat([strong_long, strong_short], ignore_index=True)
+
+    # Kalanlar: TOP adaylar (uçlara en yakınlar)
+    # LONG için RAW desc, SHORT için RAW asc
+    rest = df[~df["STRONG"]].copy()
+    rest_long = rest[rest["YÖN"] == "LONG"].sort_values(["RAW", "QV_24H"], ascending=[False, False])
+    rest_short = rest[rest["YÖN"] == "SHORT"].sort_values(["RAW", "QV_24H"], ascending=[True, False])
+
+    # Denge: 10 LONG + 10 SHORT
+    out_rows = []
+    used = set()
+
+    def take_rows(xdf, n):
+        nonlocal out_rows, used
+        for _, r in xdf.iterrows():
+            if len(out_rows) >= N_TOTAL:
+                break
+            key = (r["COIN"], r["YÖN"])
+            if key in used:
+                continue
+            out_rows.append(r)
+            used.add(key)
+            if sum(1 for rr in out_rows if rr["YÖN"] == xdf.iloc[0]["YÖN"]) >= n:
+                break
+
+    # STRONG'ları önce al (dengeyi mümkünse koru)
+    # STRONG içinde zaten karışık gelebilir; count bazlı toplayalım
+    out_long = 0
+    out_short = 0
+    for _, r in strong_ordered.iterrows():
+        if len(out_rows) >= N_TOTAL:
+            break
+        if r["YÖN"] == "LONG" and out_long >= N_LONG:
+            continue
+        if r["YÖN"] == "SHORT" and out_short >= N_SHORT:
+            continue
+        key = (r["COIN"], r["YÖN"])
+        if key in used:
+            continue
+        out_rows.append(r)
+        used.add(key)
+        out_long += 1 if r["YÖN"] == "LONG" else 0
+        out_short += 1 if r["YÖN"] == "SHORT" else 0
+
+    # Kalanı TOP ile doldur
+    # Önce eksik yönü tamamla
+    need_long = max(0, N_LONG - out_long)
+    need_short = max(0, N_SHORT - out_short)
+
+    if need_long > 0 and not rest_long.empty:
+        for _, r in rest_long.iterrows():
+            if need_long <= 0:
+                break
+            key = (r["COIN"], r["YÖN"])
+            if key in used:
+                continue
+            out_rows.append(r)
+            used.add(key)
+            need_long -= 1
+
+    if need_short > 0 and not rest_short.empty:
+        for _, r in rest_short.iterrows():
+            if need_short <= 0:
+                break
+            key = (r["COIN"], r["YÖN"])
+            if key in used:
+                continue
+            out_rows.append(r)
+            used.add(key)
+            need_short -= 1
+
+    # Hâlâ boşluk varsa (çok sert filtre / network), kalan en iyi uçlarla doldur (denge bozulabilir)
+    if len(out_rows) < N_TOTAL:
+        rest_all = pd.concat([rest_long, rest_short], ignore_index=True)
+        # uçlara yakınlık: max(raw, 100-raw)
+        rest_all["EXTREME"] = rest_all["RAW"].apply(lambda x: max(x, 100 - x))
+        rest_all = rest_all.sort_values(["EXTREME", "QV_24H"], ascending=[False, False])
+        for _, r in rest_all.iterrows():
+            if len(out_rows) >= N_TOTAL:
+                break
+            key = (r["COIN"], r["YÖN"])
+            if key in used:
+                continue
+            out_rows.append(r)
+            used.add(key)
+
+    out_df = pd.DataFrame(out_rows).copy()
+    if not out_df.empty:
+        # Son görünüm için kolon sırası
+        out_df = out_df[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI", "STRONG"]]
+        # STRONG önce gelsin, sonra TOP (SKOR’a göre)
+        out_df["_rank"] = out_df.apply(
+            lambda r: (0 if r["STRONG"] else 1,
+                       -r["RAW"] if r["YÖN"] == "LONG" else r["RAW"],
+                       -r["QV_24H"]),
+            axis=1
+        )
+        out_df = out_df.sort_values("_rank").drop(columns=["_rank"]).reset_index(drop=True)
+
+    return strong_df, out_df
+
+
+# =========================================================
+# TABLE STYLING (LONG yeşil / SHORT kırmızı; STRONG daha koyu)
+# =========================================================
+def style_table(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
+    if df.empty:
+        return df.style
+
+    # renkler
+    LONG_BG = "#0f3d2e"          # normal long
+    SHORT_BG = "#4a1518"         # normal short
+    STRONG_LONG_BG = "#0a2a1f"   # daha koyu long
+    STRONG_SHORT_BG = "#2e0c0f"  # daha koyu short
+
+    TEXT = "color: #e7edf5; font-weight: 600;"
+    BORDER = "border: 1px solid rgba(255,255,255,.07);"
 
     def row_style(row):
-        direction = str(row.get("YÖN", ""))
-        strong = bool(row.get("STRONG", False))
-
-        if direction == "LONG":
-            bg = STRONG_LONG_BG if strong else LONG_BG
-        elif direction == "SHORT":
-            bg = STRONG_SHORT_BG if strong else SHORT_BG
+        is_strong = bool(row.get("STRONG", False))
+        if row["YÖN"] == "LONG":
+            bg = STRONG_LONG_BG if is_strong else LONG_BG
         else:
-            bg = "#0f1722"
+            bg = STRONG_SHORT_BG if is_strong else SHORT_BG
+        return [f"background-color: {bg}; {TEXT} {BORDER}"] * len(row)
 
-        return [f"background-color: {bg}; {BASE_TEXT} {BORDER}"] * len(row)
+    sty = df.style.apply(row_style, axis=1)
 
-    sty = (
-        df.style
-        .apply(row_style, axis=1)
-        .set_table_styles([
-            {"selector": "th", "props": [("background-color", HEAD_BG), ("color", "#e8eef6"), ("border", "1px solid #1f2a3a")]},
-            {"selector": "td", "props": [("border", "1px solid #1f2a3a")]},
-            {"selector": "table", "props": [("border-collapse", "collapse"), ("width", "100%")]},
-        ])
-        .format({
+    # header + genel
+    sty = sty.set_table_styles(
+        [
+            {"selector": "th", "props": [("background-color", "#0f1722"),
+                                         ("color", "#e7edf5"),
+                                         ("border", "1px solid rgba(255,255,255,.08)"),
+                                         ("font-weight", "700")]},
+            {"selector": "td", "props": [("border", "1px solid rgba(255,255,255,.06)")]},
+        ]
+    )
+
+    # format
+    sty = sty.format(
+        {
             "FİYAT": "{:.6f}",
             "QV_24H": "{:,.0f}",
-            "RAW": "{:.0f}",
-            "SKOR": "{:.0f}",
-            "KAPI": "{:d}",
-        }, na_rep="-")
+        }
     )
     return sty
 
-# ----------------------------
-# EVRENİ TOPLA + HESAPLA
-# ----------------------------
-def build_table():
-    prog = st.progress(0, text="⏳ KuCoin USDT evreni hazırlanıyor...")
-    t0 = time.time()
 
-    tickers = fetch_all_tickers()
+# =========================================================
+# UI
+# =========================================================
+st.title("🎯 KuCoin PRO Sniper — Auto (LONG + SHORT)")
+st.markdown(
+    f"<div class='muted'>TF={TF} • STRONG: SKOR≥{STRONG_LONG_RAW} (LONG) / SKOR≤{STRONG_SHORT_RAW} (SHORT) • 6 Kapı • Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s</div>",
+    unsafe_allow_html=True
+)
+st.markdown(f"<div class='tiny'>İstanbul Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>", unsafe_allow_html=True)
 
-    tickers = tickers[tickers["symbolName"].apply(is_usdt_spot)]
-    tickers = tickers[~tickers["symbolName"].apply(is_junk)]
+# LOADING / PROGRESS alanı
+progress = st.progress(0, text="⏳ KuCoin USDT spot evreni taranıyor...")
 
-    tickers["volValue"] = pd.to_numeric(tickers.get("volValue", 0), errors="coerce").fillna(0.0)
-    tickers = tickers[tickers["volValue"] >= VOLVALUE_MIN]
-    tickers = tickers.sort_values("volValue", ascending=False).head(MAX_SYMBOLS).copy()
+# REGIME
+regime_label, regime_bias = calc_regime()
+if "LONG BIAS" in regime_label:
+    st.markdown(f"<div class='pill-ok'>🟢 REGIME: {regime_label}</div>", unsafe_allow_html=True)
+elif "SHORT BIAS" in regime_label:
+    st.markdown(f"<div class='pill-bad'>🔴 REGIME: {regime_label}</div>", unsafe_allow_html=True)
+else:
+    st.markdown(f"<div class='pill-warn'>⚠️ REGIME: {regime_label}</div>", unsafe_allow_html=True)
 
-    universe_count = int(len(tickers))
-    prog.progress(10, text=f"🧠 Evren (USDT spot): {universe_count} • Likidite filtresi aktif • Tarama başlıyor...")
+# TICKERS
+all_df, universe = get_all_tickers()
 
-    reg_txt, bias = regime_label()
-    prog.progress(15, text=f"📈 Rejim okunuyor... ({bias})")
+evren_total = len(all_df[all_df["symbol"].str.endswith("-USDT")])
+evren_after = len(universe)
 
-    rows = []
-    scanned = 0
-    total = universe_count if universe_count else 1
+# Tarama sayısı = evren_after (MAX_SCAN'e göre zaten kırpılıyor)
+st.markdown(
+    f"<div class='sniper-card'>🧠 Evren (USDT spot): <b>{evren_total}</b> • Likidite filtresi sonrası: <b>{evren_after}</b> • Tarama: <b>{evren_after}</b></div>",
+    unsafe_allow_html=True
+)
 
-    for _, r in tickers.iterrows():
-        sym = r["symbolName"]
-        qv = safe_float(r.get("volValue", 0.0), 0.0)
-        last = safe_float(r.get("last", 0.0), 0.0)
+# TARAMA
+rows = []
+start = time.time()
 
-        try:
-            cdf = fetch_candles(sym, TF, CANDLE_LIMIT)
-            raw, gate_pass = compute_raw_and_gates(cdf)
+with st.spinner("🔎 Sinyaller hesaplanıyor (RAW/Skor/6 Kapı)..."):
+    for i, r in universe.iterrows():
+        symbol = r["symbol"]
+        qv = float(r["volValue"])
+        last = float(r["last"])
 
-            if bias == "SHORT":
-                raw = float(np.clip(raw - 2.0, 0, 100))
-            elif bias == "LONG":
-                raw = float(np.clip(raw + 2.0, 0, 100))
+        out = compute_signal(symbol, qv, last, regime_bias)
+        if out:
+            rows.append(out)
 
-            skor = round_to_step(raw, SCORE_STEP)
-            yon = "LONG" if raw >= 50 else "SHORT"
+        # progress
+        if evren_after > 0:
+            pct = int((i + 1) / evren_after * 100)
+            progress.progress(min(pct, 100), text=f"⏳ Tarama: {i+1}/{evren_after} • {pct}%")
 
-            strong = False
-            if gate_pass >= STRONG_GATES_REQUIRED:
-                if yon == "LONG" and raw >= STRONG_LONG_RAW:
-                    strong = True
-                if yon == "SHORT" and raw <= STRONG_SHORT_RAW:
-                    strong = True
+progress.progress(100, text=f"✅ Bitti • {int(time.time()-start)}s")
 
-            rows.append({
-                "YÖN": yon,
-                "COIN": sym.replace("-USDT", ""),
-                "SKOR": int(skor),
-                "FİYAT": float(last) if last else (float(cdf["close"].iloc[-1]) if (cdf is not None and not cdf.empty) else float("nan")),
-                "RAW": float(raw),
-                "QV_24H": float(qv),
-                "KAPI": int(gate_pass),
-                "STRONG": bool(strong),
-            })
-        except Exception:
-            pass
+df = pd.DataFrame(rows)
 
-        scanned += 1
-        if scanned % 15 == 0 or scanned == total:
-            p = 15 + int((scanned / total) * 80)
-            prog.progress(min(p, 95), text=f"🔎 Taranıyor... {scanned}/{total}")
-
-    prog.progress(96, text="🧩 STRONG + TOP doldurma hazırlanıyor...")
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        prog.progress(100, text="❌ Veri gelmedi (network/KuCoin).")
-        return reg_txt, bias, universe_count, 0, pd.DataFrame()
-
-    strong_df = df[df["STRONG"] == True].copy()
-    strong_df["_rank"] = strong_df.apply(
-        lambda x: (100 - x["RAW"]) if x["YÖN"] == "LONG" else x["RAW"],
-        axis=1
+# Eğer tarama sonucu boş gelirse fallback mesaj
+if df.empty:
+    st.markdown(
+        "<div class='pill-warn'>⚠️ Aday yok (network/KuCoin veya filtre çok sert). Bir sonraki auto refresh’i bekle.</div>",
+        unsafe_allow_html=True
     )
-    strong_df = strong_df.sort_values(["_rank"], ascending=True).drop(columns=["_rank"])
+    st.stop()
 
-    TARGET_N = 20
+# STRONG + TOP seçimi
+strong_df, table_df = pick_table(df)
 
-    fallback_pool = df[df["KAPI"] >= FALLBACK_MIN_GATES].copy()
+# SAYIMLAR (SENİN İSTEDİĞİN: strong long/short ve total long/short)
+strong_long_cnt = int(((df["STRONG"]) & (df["YÖN"] == "LONG")).sum())
+strong_short_cnt = int(((df["STRONG"]) & (df["YÖN"] == "SHORT")).sum())
+long_cnt = int((table_df["YÖN"] == "LONG").sum()) if not table_df.empty else 0
+short_cnt = int((table_df["YÖN"] == "SHORT").sum()) if not table_df.empty else 0
 
-    def proximity(row):
-        if row["YÖN"] == "LONG":
-            return abs(row["RAW"] - STRONG_LONG_RAW)
-        return abs(row["RAW"] - STRONG_SHORT_RAW)
+# Renk ikonları: LONG yeşil, SHORT kırmızı (doğru)
+st.markdown(
+    f"""
+    <div class='sniper-card'>
+      ✅ <b>STRONG LONG</b>: {strong_long_cnt} 🟩 &nbsp;&nbsp;
+      ✅ <b>STRONG SHORT</b>: {strong_short_cnt} 🟥<br/>
+      <b>LONG</b>: {long_cnt} 🟩 &nbsp;&nbsp;
+      <b>SHORT</b>: {short_cnt} 🟥
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
-    fallback_pool["_prox"] = fallback_pool.apply(proximity, axis=1)
-    fallback_pool = fallback_pool.sort_values(["_prox", "KAPI", "QV_24H"], ascending=[True, False, False])
+st.subheader("🎯 SNIPER TABLO")
 
-    result = strong_df.copy()
+# STRONG mesajı
+if (strong_long_cnt + strong_short_cnt) > 0:
+    st.markdown(
+        "<div class='pill-ok'>✅ STRONG bulundu. Kalan boşluklar TOP adaylarla dolduruldu.</div>",
+        unsafe_allow_html=True
+    )
+else:
+    st.markdown(
+        "<div class='pill-warn'>⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu.</div>",
+        unsafe_allow_html=True
+    )
 
-    def add_rows(from_df, need, exclude_set):
-        out = []
-        for _, rr in from_df.iterrows():
-            key = rr["COIN"]
-            if key in exclude_set:
-                continue
-            out.append(rr)
-            exclude_set.add(key)
-            if len(out) >= need:
-                break
-        return out
+# tablo
+sty = style_table(table_df)
+st.dataframe(sty, use_container_width=True, height=520)
 
-    used = set(result["COIN"].tolist())
-    want_long, want_short = 10, 10
-    cur_long = int((result["YÖN"] == "LONG").sum()) if not result.empty else 0
-    cur_short = int((result["YÖN"] == "SHORT").sum()) if not result.empty else 0
-    need_long = max(0, want_long - cur_long)
-    need_short = max(0, want_short - cur_short)
+# AUTO REFRESH
+time.sleep(0.1)
+st.markdown(f"<div class='tiny'>Auto refresh: {AUTO_REFRESH_SEC}s</div>", unsafe_allow_html=True)
+st.write("")  # spacing
+st.write("")  # spacing
 
-    fb_long = fallback_pool[fallback_pool["YÖN"] == "LONG"]
-    fb_short = fallback_pool[fallback_pool["YÖN"] == "SHORT"]
-
-    addL = add_rows(fb_long, need_long, used)
-    addS = add_rows(fb_short, need_short, used)
-
-    if addL:
-        result = pd.concat([result, pd.DataFrame(addL)], ignore_index=True)
-    if addS:
-        result = pd.concat([result, pd.DataFrame(addS)], ignore_index=True)
-
-    if len(result) < TARGET_N:
-        need = TARGET_N - len(result)
-        addAny = add_rows(fallback_pool, need, used)
-        if addAny:
-            result = pd.concat([result, pd.DataFrame(addAny)], ignore_index=True)
-
-    result = result.head(TARGET_N).copy()
-    result["_prox"] = result.apply(proximity, axis=1)
-    result = result.sort_values(["STRONG", "_prox", "QV_24H"], ascending=[False, True, False]).drop(columns=["_prox"])
-
-    prog.progress(100, text=f"✅ Bitti • {int(time.time()-t0)}s")
-
-    return reg_txt, bias, universe_count, len(df), result.reset_index(drop=True)
-
-# ----------------------------
-# ÇALIŞTIR + CACHE
-# ----------------------------
-if "last_df" not in st.session_state:
-    st.session_state.last_df = pd.DataFrame()
-
-try:
-    reg_txt, bias, ucount, scanned_count, out = build_table()
-
-    if "SHORT BIAS" in reg_txt:
-        st.markdown(f"<div class='sniper-warn'>⛔ {reg_txt}</div>", unsafe_allow_html=True)
-    elif "LONG BIAS" in reg_txt:
-        st.markdown(f"<div class='sniper-ok'>✅ {reg_txt}</div>", unsafe_allow_html=True)
-    elif "NEUTRAL" in reg_txt:
-        st.markdown(f"<div class='sniper-warn'>⚠️ {reg_txt}</div>", unsafe_allow_html=True)
-    else:
-        st.markdown(f"<div class='sniper-warn'>⚠️ {reg_txt}</div>", unsafe_allow_html=True)
-
-    if out is None or out.empty:
-        if st.session_state.last_df is not None and not st.session_state.last_df.empty:
-            st.markdown("<div class='sniper-warn'>⚠️ Bu turda veri gelmedi (network/KuCoin). Son başarılı tarama gösteriliyor.</div>", unsafe_allow_html=True)
-            out = st.session_state.last_df.copy()
-        else:
-            st.markdown("<div class='sniper-warn'>⚠️ Aday yok (network/KuCoin veya filtre çok sert). Bir sonraki auto refresh’i bekle.</div>", unsafe_allow_html=True)
-
-    if out is not None and not out.empty:
-        st.session_state.last_df = out.copy()
-
-        strong_long = int(((out["YÖN"] == "LONG") & (out["STRONG"] == True)).sum())
-        strong_short = int(((out["YÖN"] == "SHORT") & (out["STRONG"] == True)).sum())
-        long_cnt = int((out["YÖN"] == "LONG").sum())
-        short_cnt = int((out["YÖN"] == "SHORT").sum())
-
-        st.markdown(
-            f"""
-            <div class="sniper-card">
-              🧠 Evren (USDT spot): <b>{ucount}</b> • Tarama: <b>{scanned_count}</b><br>
-              ✅ <b>STRONG LONG:</b> {strong_long} • 🟥 <b>STRONG SHORT:</b> {strong_short} •
-              🟩 <b>LONG:</b> {long_cnt} • 🟥 <b>SHORT:</b> {short_cnt}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    st.markdown("## 🎯 SNIPER TABLO")
-
-    if out is not None and not out.empty:
-        show = out[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI", "STRONG"]].copy()
-        st.dataframe(style_table(show), use_container_width=True, hide_index=True)
-    else:
-        st.markdown("<div class='sniper-warn'>⚠️ Tablo boş.</div>", unsafe_allow_html=True)
-
-except Exception as e:
-    if st.session_state.last_df is not None and not st.session_state.last_df.empty:
-        st.markdown("<div class='sniper-warn'>⚠️ Uygulama bu turda hata verdi. Son başarılı tarama gösteriliyor.</div>", unsafe_allow_html=True)
-        show = st.session_state.last_df.copy()
-        show = show[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI", "STRONG"]]
-        st.dataframe(style_table(show), use_container_width=True, hide_index=True)
-    else:
-        st.error(f"Hata: {e}")
+# Streamlit'te otomatik refresh için: st_autorefresh yoksa basit yöntem
+# (Cloud'da genelde sorun çıkarmadan çalışır)
+st.markdown(
+    f"""
+    <script>
+      setTimeout(function() {{
+        window.location.reload();
+      }}, {AUTO_REFRESH_SEC * 1000});
+    </script>
+    """,
+    unsafe_allow_html=True
+)
