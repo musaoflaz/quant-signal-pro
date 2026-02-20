@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -35,7 +35,7 @@ SCORE_STEP = 5          # skor 5'lik adımda
 CANDLE_LIMIT_TF = 220
 CANDLE_LIMIT_HTF = 180
 
-# Gate/Score ağırlıkları (RAW 0-100 üretir)
+# RAW 0-100 ağırlıkları
 W_TREND = 15
 W_RSI   = 25
 W_BB    = 20
@@ -181,7 +181,6 @@ def pick_top_symbols(ex_id: str, top_n: int) -> tuple[list[str], dict, str | Non
             if is_spot_usdt_market(m) and sym.endswith("/USDT"):
                 syms.append(sym)
 
-        # rank by quote volume (tickers)
         ranked = []
         for s in syms:
             ranked.append((s, ticker_quote_volume(tickers.get(s, {}))))
@@ -203,11 +202,24 @@ def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -
 
 # =========================================================
 # SCORE (RAW 0-100) + 6 KAPI + 5'lik SKOR
+# FIXES:
+#  - STRONG artık KAPI==6 olmadan True OLAMAZ
+#  - Yön seçimi LONG'a kaymasın diye LONG ve SHORT RAW ayrı hesaplanır, en güçlü olan seçilir
 # =========================================================
 def round_step(x: int, step: int) -> int:
     return int(np.clip(int(round(x / step) * step), 0, 100))
 
-def compute_raw_and_gates(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24: float) -> dict:
+def _liq_points(qv24: float) -> int:
+    liq_pts = int(W_LIQ * 0.25)
+    if qv24 >= MIN_QV_STR:
+        liq_pts = W_LIQ
+    elif qv24 >= MIN_QV_OK:
+        liq_pts = int(W_LIQ * 0.7)
+    elif qv24 >= MIN_QV_WEAK:
+        liq_pts = int(W_LIQ * 0.45)
+    return liq_pts
+
+def _score_for_direction(direction: str, df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24: float) -> dict:
     c = df_tf["close"].to_numpy(dtype=float)
     h = df_tf["high"].to_numpy(dtype=float)
     l = df_tf["low"].to_numpy(dtype=float)
@@ -216,7 +228,7 @@ def compute_raw_and_gates(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24
 
     r = rsi(c, 14)
     s20 = sma(c, 20)
-    mid, bbu, bbl = bollinger(c, 20, 2.0)
+    _, bbu, bbl = bollinger(c, 20, 2.0)
     a = adx(h, l, c, 14)
 
     last_rsi = float(r[-1])
@@ -225,65 +237,16 @@ def compute_raw_and_gates(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24
     last_bbl = float(bbl[-1]) if np.isfinite(bbl[-1]) else np.nan
     last_adx = float(a[-1])
 
-    # --- Liquidity points
-    liq_pts = int(W_LIQ * 0.25)
-    if qv24 >= MIN_QV_STR:
-        liq_pts = W_LIQ
-    elif qv24 >= MIN_QV_OK:
-        liq_pts = int(W_LIQ * 0.7)
-    elif qv24 >= MIN_QV_WEAK:
-        liq_pts = int(W_LIQ * 0.45)
+    liq_pts = _liq_points(qv24)
 
-    # --- Decide bias (LONG/SHORT) via “forces”
-    long_force = 0
-    short_force = 0
-
-    # RSI force
-    if last_rsi <= 35:
-        long_force += 2
-    elif last_rsi <= 45:
-        long_force += 1
-    if last_rsi >= 65:
-        short_force += 2
-    elif last_rsi >= 55:
-        short_force += 1
-
-    # BB force
-    if np.isfinite(last_bbl) and last <= last_bbl * 1.01:
-        long_force += 2
-    if np.isfinite(last_bbu) and last >= last_bbu * 0.99:
-        short_force += 2
-
-    # Trend vs SMA
-    if np.isfinite(last_sma):
-        if last < last_sma:
-            long_force += 1
-        elif last > last_sma * 1.01:
-            short_force += 1
-
-    # If tie, keep neutral but we still compute RAW
-    direction = "LONG" if long_force >= short_force else "SHORT"
-
-    # --- RAW scoring (conservative)
     raw = 50
 
-    # Trend (SMA20)
-    trend_pts = int(W_TREND * 0.35)
+    # Trend (SMA20): LONG için sma altı "değer" / SHORT için sma üstü "değer"
     if np.isfinite(last_sma):
         if direction == "LONG":
-            if last < last_sma:
-                raw += W_TREND
-                trend_pts = W_TREND
-            else:
-                raw -= W_TREND
-                trend_pts = 0
+            raw += W_TREND if last < last_sma else -W_TREND
         else:
-            if last > last_sma:
-                raw -= W_TREND
-                trend_pts = W_TREND
-            else:
-                raw += W_TREND
-                trend_pts = 0
+            raw += W_TREND if last > last_sma else -W_TREND
 
     # RSI
     if direction == "LONG":
@@ -297,13 +260,13 @@ def compute_raw_and_gates(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24
             raw += int(W_RSI * 0.35)
     else:
         if last_rsi >= 65:
-            raw -= W_RSI
-        elif last_rsi >= 55:
-            raw -= int(W_RSI * 0.6)
-        elif last_rsi <= 35:
             raw += W_RSI
+        elif last_rsi >= 55:
+            raw += int(W_RSI * 0.6)
+        elif last_rsi <= 35:
+            raw -= W_RSI
         else:
-            raw -= int(W_RSI * 0.35)
+            raw += int(W_RSI * 0.35)
 
     # Bollinger
     if direction == "LONG":
@@ -315,13 +278,13 @@ def compute_raw_and_gates(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24
             raw += int(W_BB * 0.35)
     else:
         if np.isfinite(last_bbu) and last >= last_bbu * 0.99:
-            raw -= W_BB
-        elif np.isfinite(last_bbl) and last <= last_bbl * 1.01:
             raw += W_BB
+        elif np.isfinite(last_bbl) and last <= last_bbl * 1.01:
+            raw -= W_BB
         else:
-            raw -= int(W_BB * 0.35)
+            raw += int(W_BB * 0.35)
 
-    # ADX (trend strength gate)
+    # ADX (trend strength)
     if last_adx >= 25:
         raw += W_ADX
     elif last_adx >= 20:
@@ -329,7 +292,7 @@ def compute_raw_and_gates(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24
     else:
         raw += int(W_ADX * 0.2)
 
-    # HTF confirmation
+    # HTF confirmation (1h)
     htf_ok = False
     if df_htf is not None and len(df_htf) >= 60:
         c1 = df_htf["close"].to_numpy(dtype=float)
@@ -344,12 +307,13 @@ def compute_raw_and_gates(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24
                     htf_ok = True
     raw += W_HTF if htf_ok else int(W_HTF * 0.25)
 
-    # Liquidity to raw (small but important)
+    # Liquidity to raw
     raw += liq_pts
 
     raw = int(np.clip(raw, 0, 100))
+    score = round_step(raw, SCORE_STEP)
 
-    # 6 KAPI
+    # 6 KAPI (direction-aware on HTF + basic)
     gates = 0
     gates += 1 if (last_rsi <= 45 or last_rsi >= 55) else 0
     gates += 1 if ((np.isfinite(last_bbl) and last <= last_bbl * 1.01) or (np.isfinite(last_bbu) and last >= last_bbu * 0.99)) else 0
@@ -358,22 +322,49 @@ def compute_raw_and_gates(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24
     gates += 1 if htf_ok else 0
     gates += 1 if (qv24 >= MIN_QV_WEAK) else 0
 
+    # FIX: STRONG = gate==6 + eşik
+    strong = False
+    if int(gates) == 6:
+        if direction == "LONG" and score >= STRONG_LONG_MIN:
+            strong = True
+        if direction == "SHORT" and score <= STRONG_SHORT_MAX:
+            strong = True
+
     return {
         "direction": direction,
         "raw": raw,
-        "score": round_step(raw, SCORE_STEP),
-        "price": last,
-        "qv24": qv24,
+        "score": int(score),
+        "price": float(last),
+        "qv24": float(qv24),
         "gates": int(gates),
-        "strong": (round_step(raw, SCORE_STEP) >= STRONG_LONG_MIN) if direction == "LONG" else (round_step(raw, SCORE_STEP) <= STRONG_SHORT_MAX),
+        "strong": bool(strong),
     }
+
+def compute_best_pack(df_tf: pd.DataFrame, df_htf: pd.DataFrame | None, qv24: float) -> dict:
+    long_pack = _score_for_direction("LONG", df_tf, df_htf, qv24)
+    short_pack = _score_for_direction("SHORT", df_tf, df_htf, qv24)
+
+    # direction choice by "conviction"
+    # - LONG conviction = score (higher better)
+    # - SHORT conviction = (100 - score) (lower better)
+    long_conv = long_pack["score"]
+    short_conv = 100 - short_pack["score"]
+
+    # If equal, prefer the one with higher gates (rare)
+    if long_conv > short_conv:
+        return long_pack
+    if short_conv > long_conv:
+        return short_pack
+
+    return long_pack if long_pack["gates"] >= short_pack["gates"] else short_pack
 
 
 # =========================================================
 # BUILD ROWS (KuCoin + OKX) + BOTH confirmation
+# FIX:
+#  - BOTH sadece iki borsada da STRONG + KAPI==6 + aynı yön ise
 # =========================================================
 def build_rows() -> tuple[pd.DataFrame, dict]:
-    # connect + pick symbols
     ku_syms, ku_tickers, ku_err = pick_top_symbols("kucoin", TOP_N)
     ok_syms, ok_tickers, ok_err = pick_top_symbols("okx", TOP_N)
 
@@ -384,7 +375,6 @@ def build_rows() -> tuple[pd.DataFrame, dict]:
         "ok_err": ok_err,
     }
 
-    # create live exchanges for ohlcv
     ex_ku = make_exchange("kucoin") if status["kucoin_ok"] else None
     ex_ok = make_exchange("okx") if status["okx_ok"] else None
     if ex_ku:
@@ -392,11 +382,12 @@ def build_rows() -> tuple[pd.DataFrame, dict]:
     if ex_ok:
         safe_load_markets(ex_ok)
 
-    # union
-    all_syms = sorted(set(ku_syms).union(set(ok_syms)))
-    rows = []
+    ku_set = set(ku_syms)
+    ok_set = set(ok_syms)
+    all_syms = sorted(ku_set.union(ok_set))
 
-    prog = st.progress(0)
+    rows = []
+    prog = st.progress(0.0)
     info = st.empty()
 
     total = max(1, len(all_syms))
@@ -405,53 +396,44 @@ def build_rows() -> tuple[pd.DataFrame, dict]:
         if i == 1 or i % 10 == 0 or i == total:
             info.info(f"Taranıyor: {i}/{total} • {sym}")
 
-        # KuCoin
         ku_pack = None
-        if ex_ku and sym in set(ku_syms):
+        ok_pack = None
+
+        if ex_ku and sym in ku_set:
             qv = ticker_quote_volume(ku_tickers.get(sym, {}))
             df15 = fetch_ohlcv_df(ex_ku, sym, TF, CANDLE_LIMIT_TF)
             if df15 is not None:
                 df1h = fetch_ohlcv_df(ex_ku, sym, HTF, CANDLE_LIMIT_HTF)
-                ku_pack = compute_raw_and_gates(df15, df1h, qv)
+                ku_pack = compute_best_pack(df15, df1h, qv)
 
-        # OKX
-        ok_pack = None
-        if ex_ok and sym in set(ok_syms):
+        if ex_ok and sym in ok_set:
             qv = ticker_quote_volume(ok_tickers.get(sym, {}))
             df15 = fetch_ohlcv_df(ex_ok, sym, TF, CANDLE_LIMIT_TF)
             if df15 is not None:
                 df1h = fetch_ohlcv_df(ex_ok, sym, HTF, CANDLE_LIMIT_HTF)
-                ok_pack = compute_raw_and_gates(df15, df1h, qv)
+                ok_pack = compute_best_pack(df15, df1h, qv)
 
-        # decide combined (BOTH) rule:
-        # if both exist and directions match AND both are strong -> BOTH strong row
-        both_strong = False
-        direction = None
-        score = None
-        raw = None
-        price = None
-        qv24 = None
-        gates = None
-        source = None
+        # BOTH (only if both STRONG + same direction)
+        if ku_pack and ok_pack and ku_pack["strong"] and ok_pack["strong"] and ku_pack["direction"] == ok_pack["direction"]:
+            direction = ku_pack["direction"]
 
-        if ku_pack and ok_pack:
-            if ku_pack["direction"] == ok_pack["direction"] and ku_pack["strong"] and ok_pack["strong"]:
-                both_strong = True
-                source = "BOTH"
-                direction = ku_pack["direction"]
-                # conservative: take the weaker as displayed score
-                raw = int(min(ku_pack["raw"], ok_pack["raw"])) if direction == "LONG" else int(max(ku_pack["raw"], ok_pack["raw"]))
-                score = round_step(raw, SCORE_STEP)
-                # pick higher liquidity for display
-                pick = ku_pack if ku_pack["qv24"] >= ok_pack["qv24"] else ok_pack
-                price = pick["price"]
-                qv24 = pick["qv24"]
-                gates = int(min(ku_pack["gates"], ok_pack["gates"]))
+            # conservative: use weaker conviction among the two
+            if direction == "LONG":
+                raw = int(min(ku_pack["raw"], ok_pack["raw"]))
             else:
-                # not dual-confirmed -> keep single best candidate later
-                pass
+                raw = int(max(ku_pack["raw"], ok_pack["raw"]))
 
-        if both_strong:
+            score = round_step(raw, SCORE_STEP)
+            pick = ku_pack if ku_pack["qv24"] >= ok_pack["qv24"] else ok_pack
+            price = pick["price"]
+            qv24 = pick["qv24"]
+            gates = int(min(ku_pack["gates"], ok_pack["gates"]))  # should be 6 anyway
+
+            # enforce gates==6 for BOTH too
+            both_strong = (gates == 6) and (
+                (direction == "LONG" and score >= STRONG_LONG_MIN) or (direction == "SHORT" and score <= STRONG_SHORT_MAX)
+            )
+
             rows.append(
                 {
                     "YÖN": direction,
@@ -459,14 +441,13 @@ def build_rows() -> tuple[pd.DataFrame, dict]:
                     "SKOR": int(score),
                     "FİYAT": float(price),
                     "RAW": int(raw),
-                    "QV_24H": float(qv24) if qv24 is not None else 0.0,
+                    "QV_24H": float(qv24),
                     "KAPI": int(gates),
-                    "STRONG": True,
-                    "SOURCE": source,
+                    "STRONG": bool(both_strong),
+                    "SOURCE": "BOTH",
                 }
             )
         else:
-            # add KuCoin single
             if ku_pack:
                 rows.append(
                     {
@@ -481,7 +462,6 @@ def build_rows() -> tuple[pd.DataFrame, dict]:
                         "SOURCE": "KUCOIN",
                     }
                 )
-            # add OKX single
             if ok_pack:
                 rows.append(
                     {
@@ -497,7 +477,7 @@ def build_rows() -> tuple[pd.DataFrame, dict]:
                     }
                 )
 
-        time.sleep(0.02)
+        time.sleep(0.01)
 
     prog.empty()
     info.empty()
@@ -508,6 +488,9 @@ def build_rows() -> tuple[pd.DataFrame, dict]:
 
 # =========================================================
 # TABLE PICKING (STRONG first, then TOP fill to 20)
+# FIX:
+#  - SHORT'ların gelmesi için direction seçimi iyileştirildi (üstte)
+#  - Doldurma mantığı aynen, 10/10 denge korunur
 # =========================================================
 def pick_display(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -515,18 +498,16 @@ def pick_display(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
-    # severity key
+    # "yakınlık" metriği: LONG için RAW büyük, SHORT için RAW küçük daha iyi
     df["sev"] = np.where(df["YÖN"] == "LONG", df["RAW"], 100 - df["RAW"])
 
     strong = df[df["STRONG"] == True].copy()
     non = df[df["STRONG"] == False].copy()
 
-    # Sort strong: longs by RAW desc, shorts by RAW asc
-    strong_long = strong[strong["YÖN"] == "LONG"].sort_values(["RAW","QV_24H"], ascending=[False, False])
-    strong_short = strong[strong["YÖN"] == "SHORT"].sort_values(["RAW","QV_24H"], ascending=[True, False])
+    strong_long = strong[strong["YÖN"] == "LONG"].sort_values(["RAW", "QV_24H"], ascending=[False, False])
+    strong_short = strong[strong["YÖN"] == "SHORT"].sort_values(["RAW", "QV_24H"], ascending=[True, False])
 
     picked = pd.concat([strong_long, strong_short], axis=0)
-
     if len(picked) > SHOW_ROWS:
         picked = picked.head(SHOW_ROWS)
 
@@ -534,9 +515,8 @@ def pick_display(df: pd.DataFrame) -> pd.DataFrame:
     if remaining_slots <= 0:
         return picked.drop(columns=["sev"], errors="ignore").reset_index(drop=True)
 
-    # Fill with best candidates (closest to strong)
-    non_long = non[non["YÖN"] == "LONG"].sort_values(["RAW","QV_24H"], ascending=[False, False])
-    non_short = non[non["YÖN"] == "SHORT"].sort_values(["RAW","QV_24H"], ascending=[True, False])
+    non_long = non[non["YÖN"] == "LONG"].sort_values(["RAW", "QV_24H"], ascending=[False, False])
+    non_short = non[non["YÖN"] == "SHORT"].sort_values(["RAW", "QV_24H"], ascending=[True, False])
 
     fill = pd.DataFrame()
 
@@ -548,18 +528,15 @@ def pick_display(df: pd.DataFrame) -> pd.DataFrame:
 
         fill_long = non_long.head(need_long)
         fill_short = non_short.head(need_short)
-
         fill = pd.concat([fill_long, fill_short], axis=0)
 
         remaining_slots = SHOW_ROWS - (len(picked) + len(fill))
         if remaining_slots > 0:
-            # after balancing, fill rest by overall best severity
             rest = pd.concat([non_long.iloc[need_long:], non_short.iloc[need_short:]], axis=0)
-            rest = rest.sort_values(["sev","QV_24H"], ascending=[False, False]).head(remaining_slots)
+            rest = rest.sort_values(["sev", "QV_24H"], ascending=[False, False]).head(remaining_slots)
             fill = pd.concat([fill, rest], axis=0)
     else:
-        rest = non.sort_values(["sev","QV_24H"], ascending=[False, False]).head(remaining_slots)
-        fill = rest
+        fill = non.sort_values(["sev", "QV_24H"], ascending=[False, False]).head(remaining_slots)
 
     out = pd.concat([picked, fill], axis=0).head(SHOW_ROWS)
     return out.drop(columns=["sev"], errors="ignore").reset_index(drop=True)
@@ -574,11 +551,9 @@ def style_table(df: pd.DataFrame):
         is_strong = bool(row.get("STRONG", False))
 
         if direction == "LONG":
-            # green
             return ["background-color: #064e3b; color: #e6edf3; font-weight: 700;" if is_strong
                     else "background-color: rgba(6,78,59,0.55); color: #e6edf3; font-weight: 700;"] * len(row)
         if direction == "SHORT":
-            # red
             return ["background-color: #7f1d1d; color: #e6edf3; font-weight: 700;" if is_strong
                     else "background-color: rgba(127,29,29,0.55); color: #e6edf3; font-weight: 700;"] * len(row)
         return [""] * len(row)
@@ -621,14 +596,12 @@ st.title("🎯 KuCoin PRO Sniper — Auto (KuCoin + OKX)")
 
 st.caption(
     f"TF={TF} • HTF={HTF} • STRONG: SKOR≥{STRONG_LONG_MIN} (LONG) / SKOR≤{STRONG_SHORT_MAX} (SHORT) • "
-    f"Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s • Istanbul Time: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}"
+    f"6 Kapı şart • Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s • Istanbul Time: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}"
 )
 
-# Scan
 with st.spinner("🧠 KuCoin + OKX taranıyor..."):
     df_all, status = build_rows()
 
-# Connection status
 c1, c2 = st.columns(2)
 with c1:
     if status["kucoin_ok"]:
@@ -658,11 +631,11 @@ st.info(
     f"✅ STRONG LONG: {strong_long}  |  💀 STRONG SHORT: {strong_short}  |  LONG: {longs}  |  SHORT: {shorts}"
 )
 
-# Top banner
+# Banner
 if int(df_all["STRONG"].sum()) > 0:
-    st.success("✅ STRONG bulundu. Kalan boşluklar TOP adaylarla dolduruldu.")
+    st.success("✅ STRONG bulundu (KAPI=6). Kalan boşluklar TOP adaylarla dolduruldu.")
 else:
-    st.warning("⚠️ Şu an STRONG yok. Yine de TOP adaylarla tablo dolu.")
+    st.warning("⚠️ Şu an STRONG yok (KAPI=6 + eşik). Yine de TOP adaylarla tablo dolu.")
 
 # Table
 cols = ["YÖN","COIN","SKOR","FİYAT","RAW","QV_24H","KAPI","STRONG","SOURCE"]
