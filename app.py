@@ -1,15 +1,6 @@
-# requirements.txt (install these):
-# streamlit
-# pandas
-# numpy
-# ccxt
-
-from __future__ import annotations
-
+# app.py
 import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
@@ -17,762 +8,606 @@ import streamlit as st
 import ccxt
 
 
-# ============================================================
-# DUAL ENGINE: KUCOIN SPOT + BINANCE SPOT (NO TELEGRAM)
-# - Dark theme, auto-run (no clicks), progress spinner
-# - Vectorized indicators (NO pandas_ta / TA-Lib / finta)
-# - Level 1 score + Level 2 safety gates
-# - One row per BASE asset: KuCoin score + Binance score side-by-side
-# ============================================================
-
-IST_TZ = ZoneInfo("Europe/Istanbul")
-
-# Timeframes
+# =========================
+# CONFIG
+# =========================
+APP_TITLE = "Dual Exchange Sniper — KuCoin + Binance (Spot USDT)"
 TF = "15m"
 HTF = "1h"
-LIMIT = 200
-HTF_LIMIT = 200
+LIMIT_TF = 220
+LIMIT_HTF = 180
 
-# Universe / output
-TOP_PER_EXCHANGE = 150
-UNION_CAP = 220          # union of bases may grow; cap to keep runtime sane
-TOP_TABLE_N = 20
+TOP_N = 150
+REFRESH_SEC = 240  # 4 dk
 
-# Score
-SCORE_STEP = 5
-STRONG_LONG_MIN = 90
-STRONG_SHORT_MAX = 10
-LONG_MIN = 70
-SHORT_MAX = 30
+STRONG_LONG = 90
+STRONG_SHORT = 10
 
-# Level 2 gates
-MIN_QUOTE_VOL_USDT = 200_000
-MAX_SPREAD_BPS = 40
-ADX_PERIOD = 14
-ADX_STRONG = 25
-ATR_PERIOD = 14
-MAX_ATR_PCT = 4.5
-
-# Cross-check divergence thresholds
-DIVERGENCE_LONG_OTHER_MAX = 70   # if one >=90 and other <=70 -> divergence
-DIVERGENCE_SHORT_OTHER_MIN = 30  # if one <=10 and other >=30 -> divergence
-
-# CCXT
-TIMEOUT_MS = 20000
-MAX_WORKERS = 8          # small pool; ccxt + rate limits
-SLEEP_BETWEEN = 0.02     # gentle
+# Score weights (tweak later without breaking UI)
+W_RSI = 25
+W_BB = 20
+W_SMA = 15
+W_ADX = 15
+W_HTF = 15
+W_LIQ = 10  # volume/spread gate
 
 
-# -----------------------------
-# Indicator math (pure pandas/numpy)
-# -----------------------------
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period, min_periods=period).mean()
+# =========================
+# INDICATORS (vectorized)
+# =========================
+def _ema(x: np.ndarray, period: int) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    alpha = 2.0 / (period + 1.0)
+    out = np.empty_like(x)
+    out[0] = x[0]
+    for i in range(1, len(x)):
+        out[i] = alpha * x[i] + (1 - alpha) * out[i - 1]
+    return out
 
 
-def bollinger_bands(series: pd.Series, period: int, n_std: float) -> tuple[pd.Series, pd.Series, pd.Series]:
-    mid = series.rolling(period, min_periods=period).mean()
-    std = series.rolling(period, min_periods=period).std(ddof=0)
-    upper = mid + (n_std * std)
-    lower = mid - (n_std * std)
-    return mid, upper, lower
+def rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
+    close = np.asarray(close, dtype=float)
+    delta = np.diff(close, prepend=close[0])
+    gain = np.clip(delta, 0, None)
+    loss = np.clip(-delta, 0, None)
+    avg_gain = _ema(gain, period)
+    avg_loss = _ema(loss, period) + 1e-12
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def rsi_wilder(series: pd.Series, period: int) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi.fillna(50.0)
+def sma(x: np.ndarray, period: int) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if len(x) < period:
+        return np.full_like(x, np.nan)
+    c = np.cumsum(x, dtype=float)
+    c[period:] = c[period:] - c[:-period]
+    out = np.full_like(x, np.nan, dtype=float)
+    out[period - 1 :] = c[period - 1 :] / period
+    return out
 
 
-def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    prev_close = close.shift(1)
-    tr1 = (high - low).abs()
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+def bollinger(close: np.ndarray, period: int = 20, mult: float = 2.0):
+    close = np.asarray(close, dtype=float)
+    ma = sma(close, period)
+    # rolling std via convolution-ish trick (safe & simple)
+    out_std = np.full_like(close, np.nan, dtype=float)
+    if len(close) >= period:
+        for i in range(period - 1, len(close)):
+            w = close[i - period + 1 : i + 1]
+            out_std[i] = np.std(w, ddof=0)
+    upper = ma + mult * out_std
+    lower = ma - mult * out_std
+    return ma, upper, lower
 
 
-def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> tuple[pd.Series, pd.Series, pd.Series]:
-    up_move = high.diff()
-    down_move = -low.diff()
+def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    close = np.asarray(close, dtype=float)
+
+    up_move = np.diff(high, prepend=high[0])
+    down_move = -np.diff(low, prepend=low[0])
 
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    plus_dm = pd.Series(plus_dm, index=high.index)
-    minus_dm = pd.Series(minus_dm, index=high.index)
-
-    prev_close = close.shift(1)
-    tr1 = (high - low).abs()
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    atr = tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    plus_di = 100.0 * (plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr.replace(0.0, np.nan))
-    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr.replace(0.0, np.nan))
-
-    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)).fillna(0.0)
-    adx = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-
-    return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
-
-
-def round_to_step(x: float, step: int) -> int:
-    return int(max(0, min(100, round(x / step) * step)))
-
-
-# -----------------------------
-# Scoring
-# -----------------------------
-def baseline_raw_score(close: float, sma20_v: float, rsi_v: float, bb_low: float, bb_up: float) -> float:
-    score = 50.0
-    score += 20.0 if close > sma20_v else -20.0
-
-    if rsi_v < 35.0:
-        score += 40.0
-    elif rsi_v > 65.0:
-        score -= 40.0
-
-    if close <= bb_low:
-        score += 40.0
-    elif close >= bb_up:
-        score -= 40.0
-
-    return float(max(0.0, min(100.0, score)))
-
-
-def calc_spread_bps(bid: float | None, ask: float | None) -> float:
-    try:
-        if bid is None or ask is None:
-            return 9999.0
-        bid = float(bid)
-        ask = float(ask)
-        mid = (bid + ask) / 2.0
-        if mid <= 0:
-            return 9999.0
-        return ((ask - bid) / mid) * 10000.0
-    except Exception:
-        return 9999.0
-
-
-def apply_level2_gates(
-    raw: float,
-    quote_vol: float,
-    spread_bps: float,
-    atr_pct: float,
-    adx_v: float,
-    plus_di: float,
-    minus_di: float,
-    htf_close: float,
-    htf_sma20: float,
-) -> tuple[float, str]:
-    note = []
-
-    # Intended direction from raw (soft)
-    intended_long = raw >= 60.0
-    intended_short = raw <= 40.0
-
-    # Gate: Liquidity
-    if quote_vol < MIN_QUOTE_VOL_USDT:
-        raw = 50.0 + (raw - 50.0) * 0.25
-        note.append("LOW_LIQ")
-
-    # Gate: Spread
-    if spread_bps > MAX_SPREAD_BPS:
-        raw = 50.0 + (raw - 50.0) * 0.25
-        note.append("WIDE_SPR")
-
-    # Gate: ATR spike
-    if atr_pct > MAX_ATR_PCT:
-        raw = 50.0 + (raw - 50.0) * 0.35
-        note.append("SPIKY_ATR")
-
-    # Gate: ADX strong trend anti-countertrend
-    if adx_v >= ADX_STRONG:
-        if intended_long and (minus_di > plus_di):
-            raw = 50.0 + (raw - 50.0) * 0.35
-            note.append("STR_TREND_DOWN")
-        if intended_short and (plus_di > minus_di):
-            raw = 50.0 + (raw - 50.0) * 0.35
-            note.append("STR_TREND_UP")
-
-    # Gate: HTF confirmation (soft pull)
-    if not np.isnan(htf_sma20) and not np.isnan(htf_close):
-        if intended_long and (htf_close < htf_sma20):
-            raw = 50.0 + (raw - 50.0) * 0.50
-            note.append("HTF_AGAINST")
-        if intended_short and (htf_close > htf_sma20):
-            raw = 50.0 + (raw - 50.0) * 0.50
-            note.append("HTF_AGAINST")
-
-    raw = float(max(0.0, min(100.0, raw)))
-    return raw, ("|".join(note) if note else "")
-
-
-def label_from_score(score: int) -> str:
-    if score >= STRONG_LONG_MIN:
-        return "🔥 STRONG LONG"
-    if score <= STRONG_SHORT_MAX:
-        return "💀 STRONG SHORT"
-    if score >= LONG_MIN:
-        return "🟢 LONG"
-    if score <= SHORT_MAX:
-        return "🔴 SHORT"
-    return "⏳ WATCH"
-
-
-# -----------------------------
-# CCXT exchanges
-# -----------------------------
-def ex_kucoin() -> ccxt.kucoin:
-    return ccxt.kucoin({"enableRateLimit": True, "timeout": TIMEOUT_MS})
-
-
-def ex_binance() -> ccxt.binance:
-    return ccxt.binance(
-        {
-            "enableRateLimit": True,
-            "timeout": TIMEOUT_MS,
-            "options": {"defaultType": "spot"},
-        }
+    tr = np.maximum.reduce(
+        [
+            high - low,
+            np.abs(high - np.roll(close, 1)),
+            np.abs(low - np.roll(close, 1)),
+        ]
     )
+    tr[0] = high[0] - low[0]
+
+    atr = _ema(tr, period) + 1e-12
+    plus_di = 100.0 * (_ema(plus_dm, period) / atr)
+    minus_di = 100.0 * (_ema(minus_dm, period) / atr)
+
+    dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
+    return _ema(dx, period)
 
 
-def safe_fetch_tickers(ex: ccxt.Exchange) -> dict:
+# =========================
+# SCORING
+# =========================
+def score_symbol(df15: pd.DataFrame, df1h: pd.DataFrame | None, vol_quote_24h: float | None) -> dict:
+    """
+    Returns dict: score, raw, gates, signal, is_strong, details
+    """
+    c = df15["close"].to_numpy(dtype=float)
+    h = df15["high"].to_numpy(dtype=float)
+    l = df15["low"].to_numpy(dtype=float)
+
+    r = rsi(c, 14)
+    ma20, bb_u, bb_l = bollinger(c, 20, 2.0)
+    s20 = sma(c, 20)
+    a = adx(h, l, c, 14)
+
+    last = float(c[-1])
+    last_rsi = float(r[-1])
+    last_sma = float(s20[-1]) if np.isfinite(s20[-1]) else np.nan
+    last_bbu = float(bb_u[-1]) if np.isfinite(bb_u[-1]) else np.nan
+    last_bbl = float(bb_l[-1]) if np.isfinite(bb_l[-1]) else np.nan
+    last_adx = float(a[-1])
+
+    # Direction bias (simple)
+    # LONG if oversold / below bands / below sma; SHORT if opposite
+    long_bias = 0
+    short_bias = 0
+
+    # RSI contribution
+    rsi_pts = 0
+    if last_rsi <= 30:
+        long_bias += 1
+        rsi_pts = W_RSI
+    elif last_rsi <= 40:
+        long_bias += 1
+        rsi_pts = int(W_RSI * 0.6)
+    elif last_rsi >= 70:
+        short_bias += 1
+        rsi_pts = 0
+    elif last_rsi >= 60:
+        short_bias += 1
+        rsi_pts = int(W_RSI * 0.2)
+    else:
+        rsi_pts = int(W_RSI * 0.35)
+
+    # BB contribution
+    bb_pts = int(W_BB * 0.35)
+    if np.isfinite(last_bbl) and last <= last_bbl * 1.01:
+        long_bias += 1
+        bb_pts = W_BB
+    if np.isfinite(last_bbu) and last >= last_bbu * 0.99:
+        short_bias += 1
+        bb_pts = 0
+
+    # SMA contribution
+    sma_pts = int(W_SMA * 0.35)
+    if np.isfinite(last_sma):
+        if last < last_sma:
+            long_bias += 1
+            sma_pts = W_SMA
+        elif last > last_sma * 1.01:
+            short_bias += 1
+            sma_pts = 0
+
+    # ADX contribution (trend strength)
+    adx_pts = int(W_ADX * 0.35)
+    if last_adx >= 25:
+        adx_pts = W_ADX
+    elif last_adx >= 20:
+        adx_pts = int(W_ADX * 0.7)
+
+    # HTF confirmation
+    htf_pts = int(W_HTF * 0.35)
+    htf_ok = False
+    if df1h is not None and len(df1h) >= 60:
+        c1 = df1h["close"].to_numpy(dtype=float)
+        r1 = rsi(c1, 14)
+        s1 = sma(c1, 20)
+        if np.isfinite(s1[-1]):
+            # confirm direction: if we want LONG, prefer HTF RSI not overbought and price <= SMA20-ish
+            # if SHORT, prefer HTF RSI not oversold and price >= SMA20-ish
+            if long_bias >= short_bias:
+                if float(r1[-1]) <= 60 and float(c1[-1]) <= float(s1[-1]) * 1.02:
+                    htf_ok = True
+            else:
+                if float(r1[-1]) >= 40 and float(c1[-1]) >= float(s1[-1]) * 0.98:
+                    htf_ok = True
+        if htf_ok:
+            htf_pts = W_HTF
+
+    # Liquidity (simple: quote volume threshold)
+    liq_pts = int(W_LIQ * 0.25)
+    if vol_quote_24h is not None:
+        # tune thresholds if needed
+        if vol_quote_24h >= 5_000_000:
+            liq_pts = W_LIQ
+        elif vol_quote_24h >= 1_000_000:
+            liq_pts = int(W_LIQ * 0.7)
+        elif vol_quote_24h >= 250_000:
+            liq_pts = int(W_LIQ * 0.45)
+
+    total = rsi_pts + bb_pts + sma_pts + adx_pts + htf_pts + liq_pts
+    total = int(np.clip(total, 0, 100))
+
+    # Decide signal
+    if long_bias > short_bias:
+        signal = "LONG"
+    elif short_bias > long_bias:
+        signal = "SHORT"
+    else:
+        signal = "NEUTRAL"
+
+    # Gates count (visual “KAPI”)
+    gates = 0
+    gates += 1 if last_rsi <= 40 or last_rsi >= 60 else 0
+    gates += 1 if (np.isfinite(last_bbl) and last <= last_bbl * 1.01) or (np.isfinite(last_bbu) and last >= last_bbu * 0.99) else 0
+    gates += 1 if np.isfinite(last_sma) and (last < last_sma or last > last_sma * 1.01) else 0
+    gates += 1 if last_adx >= 20 else 0
+    gates += 1 if htf_ok else 0
+    gates += 1 if (vol_quote_24h is not None and vol_quote_24h >= 250_000) else 0
+
+    is_strong = (total >= STRONG_LONG) or (total <= STRONG_SHORT)
+
+    return {
+        "score": total,
+        "signal": signal,
+        "gates": gates,
+        "is_strong": is_strong,
+        "last_rsi": round(last_rsi, 2),
+        "last_adx": round(last_adx, 2),
+        "htf_ok": htf_ok,
+    }
+
+
+# =========================
+# EXCHANGE HELPERS
+# =========================
+def make_exchange(exchange_id: str):
+    klass = getattr(ccxt, exchange_id)
+    ex = klass({"enableRateLimit": True})
+    ex.load_markets()
+    return ex
+
+
+def safe_fetch_tickers(ex):
     try:
         return ex.fetch_tickers()
     except Exception:
+        # fallback: some exchanges can be picky
         return {}
 
 
-def safe_fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> list:
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+def normalize_symbol(sym: str) -> str:
+    # ccxt spot symbols are usually "ABC/USDT"
+    return sym.strip()
 
 
-def quote_volume_usdt(t: dict) -> float:
-    if not isinstance(t, dict):
-        return 0.0
-    qv = t.get("quoteVolume")
-    if qv is not None:
-        try:
-            return float(qv)
-        except Exception:
-            pass
-    bv = t.get("baseVolume")
-    last = t.get("last")
-    try:
-        if bv is not None and last is not None:
-            return float(bv) * float(last)
-    except Exception:
-        pass
-    return 0.0
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def load_spot_usdt_markets(exchange_name: str) -> dict:
-    ex = ex_kucoin() if exchange_name == "kucoin" else ex_binance()
-    markets = ex.load_markets()
-    out = {}
-    for sym, m in markets.items():
-        if not m:
+def top_usdt_symbols_from_tickers(tickers: dict, n: int) -> list[str]:
+    rows = []
+    for sym, t in tickers.items():
+        sym = normalize_symbol(sym)
+        if not sym.endswith("/USDT"):
             continue
-        if not m.get("active", True):
+        if t is None:
             continue
-        if not m.get("spot", False):
-            continue
-        if m.get("quote") != "USDT":
-            continue
-        base = m.get("base")
-        quote = m.get("quote")
-        if not base or quote != "USDT":
-            continue
-        out[sym] = {"base": base, "quote": quote}
-    return out
+        qv = t.get("quoteVolume", None)
+        bv = t.get("baseVolume", None)
+        last = t.get("last", None)
 
-
-def top_symbols_by_volume(exchange_name: str, top_n: int) -> tuple[list[str], dict]:
-    ex = ex_kucoin() if exchange_name == "kucoin" else ex_binance()
-    markets = load_spot_usdt_markets(exchange_name)
-    tickers = safe_fetch_tickers(ex)
-
-    ranked = []
-    for sym in markets.keys():
-        t = tickers.get(sym, {})
-        ranked.append((sym, quote_volume_usdt(t)))
-
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    top_syms = [s for s, _ in ranked[: min(top_n, len(ranked))]]
-
-    return top_syms, tickers
-
-
-# -----------------------------
-# Per-symbol scan
-# -----------------------------
-def scan_symbol(exchange_name: str, symbol: str, tickers: dict) -> dict | None:
-    ex = ex_kucoin() if exchange_name == "kucoin" else ex_binance()
-
-    try:
-        t = tickers.get(symbol, {}) if isinstance(tickers, dict) else {}
-        bid = t.get("bid")
-        ask = t.get("ask")
-        last = t.get("last")
-        qv = float(quote_volume_usdt(t))
-
-        ohlcv = safe_fetch_ohlcv(ex, symbol, TF, LIMIT)
-        if not ohlcv or len(ohlcv) < 60:
-            return None
-
-        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-        close = df["close"].astype(float)
-        high = df["high"].astype(float)
-        low = df["low"].astype(float)
-
-        sma20_s = sma(close, 20)
-        _, bb_up_s, bb_low_s = bollinger_bands(close, 20, 2.0)
-        rsi_s = rsi_wilder(close, 14)
-
-        atr_s = atr_wilder(high, low, close, ATR_PERIOD)
-        adx_s, pdi_s, mdi_s = adx_wilder(high, low, close, ADX_PERIOD)
-
-        htf = safe_fetch_ohlcv(ex, symbol, HTF, HTF_LIMIT)
-        if not htf or len(htf) < 40:
-            return None
-        hdf = pd.DataFrame(htf, columns=["ts", "open", "high", "low", "close", "volume"])
-        hclose = hdf["close"].astype(float)
-        hsma20 = sma(hclose, 20)
-
-        last_close = float(close.iloc[-1])
-        prev_close = float(close.iloc[-2])
-        chg_pct = ((last_close - prev_close) / prev_close) * 100.0 if prev_close else 0.0
-
-        last_sma20 = float(sma20_s.iloc[-1])
-        last_rsi = float(rsi_s.iloc[-1])
-        last_low = float(bb_low_s.iloc[-1])
-        last_up = float(bb_up_s.iloc[-1])
-
-        last_atr = float(atr_s.iloc[-1])
-        atr_pct = (last_atr / last_close) * 100.0 if last_close else np.nan
-
-        last_adx = float(adx_s.iloc[-1])
-        last_pdi = float(pdi_s.iloc[-1])
-        last_mdi = float(mdi_s.iloc[-1])
-
-        last_htf_close = float(hclose.iloc[-1])
-        last_htf_sma20 = float(hsma20.iloc[-1])
-
-        if any(np.isnan([last_sma20, last_rsi, last_low, last_up, last_atr, last_adx, last_htf_close, last_htf_sma20])):
-            return None
-
-        raw = baseline_raw_score(last_close, last_sma20, last_rsi, last_low, last_up)
-        spread_bps = calc_spread_bps(bid, ask)
-
-        raw2, note = apply_level2_gates(
-            raw=raw,
-            quote_vol=qv,
-            spread_bps=float(spread_bps),
-            atr_pct=float(atr_pct),
-            adx_v=float(last_adx),
-            plus_di=float(last_pdi),
-            minus_di=float(last_mdi),
-            htf_close=float(last_htf_close),
-            htf_sma20=float(last_htf_sma20),
-        )
-
-        score = round_to_step(raw2, SCORE_STEP)
-        sig = label_from_score(int(score))
-
-        return {
-            "symbol": symbol,
-            "last": float(last_close),
-            "chg": float(chg_pct),
-            "rsi": float(last_rsi),
-            "adx": float(last_adx),
-            "atr_pct": float(atr_pct),
-            "spread_bps": float(spread_bps),
-            "qv": float(qv),
-            "raw": float(raw2),
-            "score": int(score),
-            "signal": sig,
-            "note": note,
-        }
-
-    except (ccxt.RequestTimeout, ccxt.NetworkError, ccxt.ExchangeError):
-        return None
-    except Exception:
-        return None
-
-
-def parallel_scan(exchange_name: str, symbols: list[str], tickers: dict, progress_cb=None) -> dict[str, dict]:
-    results: dict[str, dict] = {}
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futs = {pool.submit(scan_symbol, exchange_name, s, tickers): s for s in symbols}
-        done = 0
-        total = len(futs)
-
-        for fut in as_completed(futs):
-            s = futs[fut]
-            out = None
+        # robust float conversions
+        def f(x):
             try:
-                out = fut.result()
+                return float(x)
             except Exception:
-                out = None
+                return None
 
-            if out is not None:
-                results[s] = out
+        qv = f(qv)
+        bv = f(bv)
+        last = f(last)
 
-            done += 1
-            if progress_cb:
-                progress_cb(done, total, s)
+        if qv is None:
+            if bv is not None and last is not None:
+                qv = bv * last
+            else:
+                qv = 0.0
 
-            time.sleep(SLEEP_BETWEEN)
+        rows.append((sym, qv))
 
-    return results
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [r[0] for r in rows[:n]]
 
 
-# -----------------------------
-# Merge cross-check (one row per base)
-# -----------------------------
-def build_unified_table(
-    ku_markets: dict,
-    bn_markets: dict,
-    ku_data: dict[str, dict],
-    bn_data: dict[str, dict],
-) -> pd.DataFrame:
-    # Map base -> symbol on each exchange
-    base_to_ku = {}
-    for sym, meta in ku_markets.items():
-        base_to_ku[meta["base"]] = sym
-    base_to_bn = {}
-    for sym, meta in bn_markets.items():
-        base_to_bn[meta["base"]] = sym
+def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int) -> pd.DataFrame | None:
+    try:
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv or len(ohlcv) < 50:
+            return None
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        return df
+    except Exception:
+        return None
 
-    bases = sorted(set(base_to_ku.keys()) | set(base_to_bn.keys()))
-    if len(bases) > UNION_CAP:
-        # prefer bases that have data on at least one exchange
-        bases_with_data = []
-        for b in bases:
-            ks = base_to_ku.get(b)
-            bs = base_to_bn.get(b)
-            if (ks and ks in ku_data) or (bs and bs in bn_data):
-                bases_with_data.append(b)
-        bases = bases_with_data[:UNION_CAP]
+
+# =========================
+# STREAMLIT UI
+# =========================
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+
+colA, colB, colC, colD = st.columns([1.2, 1, 1, 1])
+with colA:
+    auto = st.toggle("Auto Refresh", value=True)
+with colB:
+    top_n = st.number_input("Top N (USDT)", min_value=30, max_value=300, value=TOP_N, step=10)
+with colC:
+    tf = st.selectbox("TF", ["5m", "15m", "30m", "1h"], index=1)
+with colD:
+    refresh = st.number_input("Refresh (sec)", min_value=60, max_value=900, value=REFRESH_SEC, step=30)
+
+st.caption(f"TF={tf} • HTF={HTF} • STRONG: Score≥{STRONG_LONG} (LONG) / Score≤{STRONG_SHORT} (SHORT) • Istanbul Time: {datetime.now(timezone(timedelta(hours=3))).strftime('%Y-%m-%d %H:%M:%S')}")
+
+status_box = st.empty()
+progress = st.progress(0)
+logline = st.empty()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def connect_and_get_tickers():
+    out = {}
+    errors = {}
+
+    # Binance
+    try:
+        bx = make_exchange("binance")
+        bt = safe_fetch_tickers(bx)
+        out["binance"] = {"ex": None, "tickers": bt}
+        errors["binance"] = None
+    except Exception as e:
+        out["binance"] = {"ex": None, "tickers": {}}
+        errors["binance"] = str(e)
+
+    # KuCoin
+    try:
+        kx = make_exchange("kucoin")
+        kt = safe_fetch_tickers(kx)
+        out["kucoin"] = {"ex": None, "tickers": kt}
+        errors["kucoin"] = None
+    except Exception as e:
+        out["kucoin"] = {"ex": None, "tickers": {}}
+        errors["kucoin"] = str(e)
+
+    return out, errors
+
+
+def banner_status(errors: dict):
+    ok_bin = errors.get("binance") is None
+    ok_kuc = errors.get("kucoin") is None
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        st.markdown(f"**Binance:** {'✅ Bağlandı' if ok_bin else '❌ Hata'}")
+        if not ok_bin:
+            st.caption(errors.get("binance"))
+    with c2:
+        st.markdown(f"**KuCoin:** {'✅ Bağlandı' if ok_kuc else '❌ Hata'}")
+        if not ok_kuc:
+            st.caption(errors.get("kucoin"))
+    with c3:
+        if ok_bin and ok_kuc:
+            st.success("İki borsa da bağlı. Tabloda SOURCE = Both / Binance / KuCoin göreceksin.")
+        elif ok_bin or ok_kuc:
+            st.warning("Tek borsa bağlı. SOURCE kolonundan hangisinin çalıştığı net görünür.")
+        else:
+            st.error("İki borsa da bağlanamadı. Logs kontrol et.")
+
+
+def run_scan(top_n: int, tf: str):
+    # connect tickers (cached)
+    pack, errors = connect_and_get_tickers()
+
+    status_box.container()
+    with status_box.container():
+        banner_status(errors)
+
+    # If both dead, stop
+    if errors.get("binance") is not None and errors.get("kucoin") is not None:
+        return pd.DataFrame()
+
+    # re-create live exchange objects for OHLCV (NOT cached)
+    ex_bin = None
+    ex_kuc = None
+    if errors.get("binance") is None:
+        ex_bin = make_exchange("binance")
+    if errors.get("kucoin") is None:
+        ex_kuc = make_exchange("kucoin")
+
+    btickers = pack["binance"]["tickers"]
+    ktickers = pack["kucoin"]["tickers"]
+
+    bin_syms = top_usdt_symbols_from_tickers(btickers, top_n) if ex_bin else []
+    kuc_syms = top_usdt_symbols_from_tickers(ktickers, top_n) if ex_kuc else []
+
+    set_bin = set(bin_syms)
+    set_kuc = set(kuc_syms)
+
+    all_syms = sorted(set_bin.union(set_kuc))
+    total_jobs = len(all_syms)
+    if total_jobs == 0:
+        return pd.DataFrame()
 
     rows = []
-    for base in bases:
-        ku_sym = base_to_ku.get(base)
-        bn_sym = base_to_bn.get(base)
+    done = 0
 
-        ku = ku_data.get(ku_sym, None) if ku_sym else None
-        bn = bn_data.get(bn_sym, None) if bn_sym else None
+    for sym in all_syms:
+        done += 1
+        progress.progress(min(done / total_jobs, 1.0))
+        if done % 10 == 0 or done == 1:
+            logline.info(f"Taranıyor: {done}/{total_jobs} • {sym}")
 
-        ku_score = ku["score"] if ku else np.nan
-        bn_score = bn["score"] if bn else np.nan
+        in_bin = sym in set_bin and ex_bin is not None
+        in_kuc = sym in set_kuc and ex_kuc is not None
 
-        source = "Both" if (ku_sym and bn_sym) else ("KuCoin-only" if ku_sym else "Binance-only")
+        b = {}
+        k = {}
 
-        # Final status logic
-        status = "WATCH"
-        if ku is None and bn is None:
-            status = "NO_DATA"
+        # KuCoin side
+        if in_kuc:
+            t = ktickers.get(sym, {}) or {}
+            qv = t.get("quoteVolume", None)
+            try:
+                qv = float(qv) if qv is not None else None
+            except Exception:
+                qv = None
+
+            df15 = fetch_ohlcv_df(ex_kuc, sym, tf, LIMIT_TF)
+            df1h = None
+            if df15 is not None:
+                df1h = fetch_ohlcv_df(ex_kuc, sym, HTF, LIMIT_HTF)
+                k = score_symbol(df15, df1h, qv)
+                k["price"] = float(df15["close"].iloc[-1])
+                k["qv24h"] = qv
+
+        # Binance side
+        if in_bin:
+            t = btickers.get(sym, {}) or {}
+            qv = t.get("quoteVolume", None)
+            try:
+                qv = float(qv) if qv is not None else None
+            except Exception:
+                qv = None
+
+            df15 = fetch_ohlcv_df(ex_bin, sym, tf, LIMIT_TF)
+            df1h = None
+            if df15 is not None:
+                df1h = fetch_ohlcv_df(ex_bin, sym, HTF, LIMIT_HTF)
+                b = score_symbol(df15, df1h, qv)
+                b["price"] = float(df15["close"].iloc[-1])
+                b["qv24h"] = qv
+
+        # Decide SOURCE
+        if in_bin and in_kuc:
+            source = "Both"
+        elif in_bin:
+            source = "Binance"
         else:
-            # strong long dual
-            if (not np.isnan(ku_score)) and (not np.isnan(bn_score)) and (ku_score >= STRONG_LONG_MIN) and (bn_score >= STRONG_LONG_MIN):
-                status = "DUAL_CONFIRMED_LONG"
-            elif (not np.isnan(ku_score)) and (not np.isnan(bn_score)) and (ku_score <= STRONG_SHORT_MAX) and (bn_score <= STRONG_SHORT_MAX):
-                status = "DUAL_CONFIRMED_SHORT"
-            else:
-                # divergence (long side)
-                if (not np.isnan(ku_score)) and (ku_score >= STRONG_LONG_MIN):
-                    if (not np.isnan(bn_score)) and (bn_score <= DIVERGENCE_LONG_OTHER_MAX):
-                        status = "DIVERGENCE"
-                    else:
-                        status = "SINGLE_STRONG"
-                if (not np.isnan(bn_score)) and (bn_score >= STRONG_LONG_MIN):
-                    if (not np.isnan(ku_score)) and (ku_score <= DIVERGENCE_LONG_OTHER_MAX):
-                        status = "DIVERGENCE"
-                    else:
-                        status = "SINGLE_STRONG"
+            source = "KuCoin"
 
-                # divergence (short side)
-                if (not np.isnan(ku_score)) and (ku_score <= STRONG_SHORT_MAX):
-                    if (not np.isnan(bn_score)) and (bn_score >= DIVERGENCE_SHORT_OTHER_MIN):
-                        status = "DIVERGENCE"
-                    else:
-                        status = "SINGLE_STRONG"
-                if (not np.isnan(bn_score)) and (bn_score <= STRONG_SHORT_MAX):
-                    if (not np.isnan(ku_score)) and (ku_score >= DIVERGENCE_SHORT_OTHER_MIN):
-                        status = "DIVERGENCE"
-                    else:
-                        status = "SINGLE_STRONG"
+        # Merge scores
+        k_score = k.get("score", None)
+        b_score = b.get("score", None)
 
-        # Provide a "best side" for display (for coloring consistency)
-        # choose higher confidence: dual strong first, else max(abs(score-50))
-        best_sig = "⏳ WATCH"
-        best_score = np.nan
-        best_ex = ""
-        best_note = ""
+        # Final score:
+        # - If both: take min(score) for "confirmed strength" (more conservative)
+        # - else: take the available one
+        if source == "Both" and (k_score is not None) and (b_score is not None):
+            final_score = int(min(k_score, b_score))
+        else:
+            final_score = int(k_score if k_score is not None else (b_score if b_score is not None else 0))
 
-        def strength(s: float) -> float:
-            if np.isnan(s):
-                return -1.0
-            return abs(s - 50.0)
+        # Final signal (prefer both consistent)
+        k_sig = k.get("signal", None)
+        b_sig = b.get("signal", None)
+        if source == "Both" and k_sig and b_sig:
+            final_sig = k_sig if k_sig == b_sig else "MIXED"
+        else:
+            final_sig = k_sig if k_sig else (b_sig if b_sig else "N/A")
 
-        if (ku is not None) and (bn is not None):
-            if status.startswith("DUAL_CONFIRMED"):
-                # pick one to show label; both are strong anyway
-                best_ex = "Both"
-                best_score = max(ku_score, bn_score)
-                best_sig = "🔥 DUAL LONG" if status == "DUAL_CONFIRMED_LONG" else "💀 DUAL SHORT"
-                best_note = "DUAL"
-            else:
-                if strength(ku_score) >= strength(bn_score):
-                    best_ex, best_score, best_sig, best_note = "KuCoin", ku_score, ku["signal"], ku.get("note", "")
-                else:
-                    best_ex, best_score, best_sig, best_note = "Binance", bn_score, bn["signal"], bn.get("note", "")
-        elif ku is not None:
-            best_ex, best_score, best_sig, best_note = "KuCoin", ku_score, ku["signal"], ku.get("note", "")
-        elif bn is not None:
-            best_ex, best_score, best_sig, best_note = "Binance", bn_score, bn["signal"], bn.get("note", "")
+        # Strong logic:
+        # - Dual confirmed strong if BOTH have strong condition
+        dual_confirmed = False
+        if source == "Both" and (k_score is not None) and (b_score is not None):
+            dual_confirmed = (k_score >= STRONG_LONG and b_score >= STRONG_LONG) or (k_score <= STRONG_SHORT and b_score <= STRONG_SHORT)
+
+        # Any-strong
+        any_strong = False
+        if k_score is not None:
+            any_strong |= (k_score >= STRONG_LONG) or (k_score <= STRONG_SHORT)
+        if b_score is not None:
+            any_strong |= (b_score >= STRONG_LONG) or (b_score <= STRONG_SHORT)
+
+        # pick a display price/volume
+        price = k.get("price", None) if k.get("price", None) is not None else b.get("price", None)
+        qv = k.get("qv24h", None) if k.get("qv24h", None) is not None else b.get("qv24h", None)
 
         rows.append(
             {
-                "Signal": best_sig,
-                "Base": base,
-                "Source": source,
-                "Status": status,
-                "KuCoin_Score": ku_score,
-                "Binance_Score": bn_score,
-                "Best_Exchange": best_ex,
-                "Best_Score": best_score,
-                "KuCoin_Note": (ku.get("note", "") if ku else ""),
-                "Binance_Note": (bn.get("note", "") if bn else ""),
+                "SYMBOL": sym,
+                "SOURCE": source,
+                "KUCOIN_SCORE": k_score,
+                "BINANCE_SCORE": b_score,
+                "FINAL_SCORE": final_score,
+                "SIGNAL": final_sig,
+                "PRICE": price,
+                "QV_24H": qv,
+                "DUAL_CONFIRMED": dual_confirmed,
+                "STRONG": any_strong,
+                "KAPI_KUCOIN": k.get("gates", None),
+                "KAPI_BINANCE": b.get("gates", None),
             }
         )
 
     df = pd.DataFrame(rows)
+
+    # Rank: show strongest first
+    df["RANK_KEY"] = df["FINAL_SCORE"].fillna(0).astype(int)
+    df = df.sort_values(["STRONG", "DUAL_CONFIRMED", "RANK_KEY"], ascending=[False, False, False]).drop(columns=["RANK_KEY"])
+
     return df
 
 
-def pick_top_rows(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    if df.empty:
-        return df
+# =========================
+# RUN
+# =========================
+with st.spinner("Taranıyor..."):
+    df = run_scan(int(top_n), tf)
 
-    d = df.copy()
+progress.empty()
+logline.empty()
 
-    # Priority ranking
-    pr = np.select(
-        [
-            d["Status"].isin(["DUAL_CONFIRMED_LONG", "DUAL_CONFIRMED_SHORT"]),
-            d["Status"].eq("SINGLE_STRONG"),
-            d["Status"].eq("DIVERGENCE"),
-            d["Status"].eq("NO_DATA"),
-        ],
-        [4, 3, 2, 0],
-        default=1,  # WATCH
-    )
-    d["PR"] = pr
-
-    # Distance to elite thresholds to fill when no strong
-    # if best score above 50 -> closeness to 90; if below 50 -> closeness to 10
-    bs = d["Best_Score"].astype(float)
-    dist = np.where(
-        bs >= 50,
-        np.abs(STRONG_LONG_MIN - bs),
-        np.abs(bs - STRONG_SHORT_MAX),
-    )
-    d["DIST"] = dist
-
-    d = d.sort_values(["PR", "DIST"], ascending=[False, True])
-    d = d.drop(columns=["PR", "DIST"], errors="ignore")
-    return d.head(n).reset_index(drop=True)
-
-
-# -----------------------------
-# Styling (dark)
-# -----------------------------
-def style_table(df: pd.DataFrame):
-    def row_style(row):
-        status = str(row.get("Status", ""))
-        sig = str(row.get("Signal", ""))
-        best = row.get("Best_Score", np.nan)
-        try:
-            best = float(best)
-        except Exception:
-            best = np.nan
-
-        txt = "color: #e6edf3;"
-
-        # Dual confirmed darker
-        if status == "DUAL_CONFIRMED_LONG":
-            return "background-color: #003a00;" + txt
-        if status == "DUAL_CONFIRMED_SHORT":
-            return "background-color: #3a0000;" + txt
-
-        # Single strong (bright-ish)
-        if not np.isnan(best) and best >= STRONG_LONG_MIN:
-            return "background-color: #006400;" + txt
-        if not np.isnan(best) and best <= STRONG_SHORT_MAX:
-            return "background-color: #8B0000;" + txt
-
-        # Regular long/short colors
-        if sig == "🟢 LONG":
-            return "background-color: #0a3d0a;" + txt
-        if sig == "🔴 SHORT":
-            return "background-color: #3d0a0a;" + txt
-
-        # Divergence highlight (neutral amber-like dark)
-        if status == "DIVERGENCE":
-            return "background-color: #2a2200;" + txt
-
-        # Watch
-        return "background-color: #0b0f14;" + txt
-
-    fmt = {
-        "KuCoin_Score": "{:.0f}",
-        "Binance_Score": "{:.0f}",
-        "Best_Score": "{:.0f}",
-    }
-
-    sty = (
-        df.style.format(fmt)
-        .apply(lambda r: [row_style(r)] * len(r), axis=1)
-        .set_properties(**{"border-color": "#1f2a37"})
-        .set_table_styles(
-            [
-                {"selector": "th", "props": [("background-color", "#0f172a"), ("color", "#e6edf3"), ("border", "1px solid #1f2a37")]},
-                {"selector": "td", "props": [("border", "1px solid #1f2a37")]},
-            ]
-        )
-    )
-    return sty
-
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="DUAL Sniper — KuCoin + Binance (Spot)", layout="wide")
-
-st.markdown(
-    """
-<style>
-html, body, [class*="css"]  { background-color: #0b0f14 !important; }
-.block-container { padding-top: 1.0rem; }
-h1, h2, h3, h4, h5, h6, p, span, div { color: #e6edf3; }
-[data-testid="stHeader"] { background: rgba(0,0,0,0); }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-now_ist = datetime.now(IST_TZ)
-st.title("DUAL Sniper — KuCoin + Binance (Spot)")
-st.caption(
-    f"TF: {TF} • HTF: {HTF} • step={SCORE_STEP} • Top {TOP_PER_EXCHANGE}/exchange by QV • IST: {now_ist.strftime('%Y-%m-%d %H:%M:%S')}"
-)
-
-# Auto-run scan on load
-progress = st.progress(0, text="Starting…")
-status = st.empty()
-
-def make_progress_cb(prefix: str):
-    def _cb(done: int, total: int, sym: str):
-        pct = int((done / max(1, total)) * 100)
-        progress.progress(min(100, pct), text=f"{prefix}: {sym} ({done}/{total})")
-    return _cb
-
-with st.spinner("Scanning both exchanges…"):
-    # Prepare markets
-    ku_markets = load_spot_usdt_markets("kucoin")
-    bn_markets = load_spot_usdt_markets("binance")
-
-    # Top symbols by volume + tickers
-    try:
-        status.info("Fetching KuCoin tickers & ranking…")
-        ku_syms, ku_tickers = top_symbols_by_volume("kucoin", TOP_PER_EXCHANGE)
-    except Exception:
-        ku_syms, ku_tickers = [], {}
-
-    try:
-        status.info("Fetching Binance tickers & ranking…")
-        bn_syms, bn_tickers = top_symbols_by_volume("binance", TOP_PER_EXCHANGE)
-    except Exception:
-        bn_syms, bn_tickers = [], {}
-
-    # Scan in parallel per exchange (each task uses a fresh exchange instance)
-    ku_data = {}
-    bn_data = {}
-
-    if ku_syms:
-        status.info("Scanning KuCoin OHLCV…")
-        ku_data = parallel_scan("kucoin", ku_syms, ku_tickers, progress_cb=make_progress_cb("KuCoin"))
-    else:
-        status.warning("KuCoin symbols not available (tickers/markets failed).")
-
-    if bn_syms:
-        status.info("Scanning Binance OHLCV…")
-        bn_data = parallel_scan("binance", bn_syms, bn_tickers, progress_cb=make_progress_cb("Binance"))
-    else:
-        status.warning("Binance symbols not available (tickers/markets failed).")
-
-progress.progress(100, text="Scan complete.")
-status.empty()
-
-# Build unified
-df_unified = build_unified_table(ku_markets, bn_markets, ku_data, bn_data)
-df_top = pick_top_rows(df_unified, TOP_TABLE_N)
+if df is None or df.empty:
+    st.warning("Tablo boş geldi. (Bağlantı sorunu veya veri çekilemedi)")
+    st.stop()
 
 # Counters
-def count_strong_long(scores: pd.Series) -> int:
-    s = pd.to_numeric(scores, errors="coerce")
-    return int((s >= STRONG_LONG_MIN).sum())
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Toplam Satır", len(df))
+with c2:
+    st.metric("STRONG (any)", int(df["STRONG"].sum()))
+with c3:
+    st.metric("DUAL CONFIRMED", int(df["DUAL_CONFIRMED"].sum()))
+with c4:
+    st.metric("Both", int((df["SOURCE"] == "Both").sum()))
 
-def count_strong_short(scores: pd.Series) -> int:
-    s = pd.to_numeric(scores, errors="coerce")
-    return int((s <= STRONG_SHORT_MAX).sum())
-
-ku_str_long = count_strong_long(df_unified["KuCoin_Score"])
-ku_str_short = count_strong_short(df_unified["KuCoin_Score"])
-bn_str_long = count_strong_long(df_unified["Binance_Score"])
-bn_str_short = count_strong_short(df_unified["Binance_Score"])
-
-dual_long = int((df_unified["Status"] == "DUAL_CONFIRMED_LONG").sum())
-dual_short = int((df_unified["Status"] == "DUAL_CONFIRMED_SHORT").sum())
-
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("🔥 DUAL LONG", dual_long)
-c2.metric("💀 DUAL SHORT", dual_short)
-c3.metric("KuCoin 🔥/💀", f"{ku_str_long} / {ku_str_short}")
-c4.metric("Binance 🔥/💀", f"{bn_str_long} / {bn_str_short}")
-c5.metric("Universe (rows)", str(len(df_unified)))
-c6.metric("Top Table", str(len(df_top)))
-
-st.write("")
-
-# Display table
-if df_top.empty:
-    st.info("Aday yok (veri çekilemedi). Yenileyip tekrar deneyebilirsin.")
+# Info bar like your "final" style
+if int(df["DUAL_CONFIRMED"].sum()) > 0:
+    st.success("✅ DUAL CONFIRMED bulundu. Tabloda koyu yeşil satırlar öncelikli.")
+elif int(df["STRONG"].sum()) > 0:
+    st.info("✅ STRONG bulundu. SOURCE kolonundan Binance/KuCoin/Both net görünür.")
 else:
-    # Keep a clean final view
-    show_cols = [
-        "Signal",
-        "Base",
-        "Source",
-        "Status",
-        "KuCoin_Score",
-        "Binance_Score",
-        "Best_Exchange",
-        "Best_Score",
-        "KuCoin_Note",
-        "Binance_Note",
-    ]
-    df_show = df_top.loc[:, show_cols].copy()
-    st.dataframe(style_table(df_show), use_container_width=True, height=690)
+    st.warning("⚠️ Şu an STRONG yok. Yine de tablo dolu — fırsatlar takipte.")
+
+# Styling
+def style_rows(row):
+    # dark green if dual confirmed
+    if row.get("DUAL_CONFIRMED", False):
+        return ["background-color: rgba(0, 90, 0, 0.35);"] * len(row)
+    # bright green if strong long single exchange
+    fs = row.get("FINAL_SCORE", 0)
+    if fs >= STRONG_LONG and row.get("SOURCE") != "Both":
+        return ["background-color: rgba(0, 150, 0, 0.25);"] * len(row)
+    # red if strong short
+    if fs <= STRONG_SHORT:
+        return ["background-color: rgba(140, 0, 0, 0.28);"] * len(row)
+    return [""] * len(row)
+
+display_cols = ["SOURCE","SYMBOL","FINAL_SCORE","SIGNAL","KUCOIN_SCORE","BINANCE_SCORE","PRICE","QV_24H","KAPI_KUCOIN","KAPI_BINANCE","DUAL_CONFIRMED","STRONG"]
+df_show = df[display_cols].copy()
+
+st.dataframe(
+    df_show.style.apply(style_rows, axis=1),
+    use_container_width=True,
+    height=650
+)
+
+# Optional: quick filters (without breaking anything)
+with st.expander("Filtre (isteğe bağlı)"):
+    only_both = st.checkbox("Sadece BOTH göster", value=False)
+    only_strong = st.checkbox("Sadece STRONG göster", value=False)
+    if only_both or only_strong:
+        dff = df_show.copy()
+        if only_both:
+            dff = dff[dff["SOURCE"] == "Both"]
+        if only_strong:
+            dff = dff[dff["STRONG"] == True]
+        st.dataframe(dff.style.apply(style_rows, axis=1), use_container_width=True, height=450)
+
+# Auto refresh
+if auto:
+    st.caption(f"Otomatik yenileme: {refresh} saniye")
+    time.sleep(int(refresh))
+    st.rerun()
