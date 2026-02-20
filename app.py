@@ -1,9 +1,12 @@
+# uygulama.py
+# requirements.txt: streamlit, pandas, numpy, ccxt
+
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib import request, parse
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -11,291 +14,151 @@ import streamlit as st
 import ccxt
 
 
-# =========================================================
-# ✅ TELEGRAM (buraya yapıştır)
-# =========================================================
-TELEGRAM_BOT_TOKEN = "8330775219:AAHx20fZA6C3ONs5S8ELQrMpFEYba-bPN1k"
-TELEGRAM_CHAT_ID = "1358384022"
-
-# =========================================================
-# FINAL BASE (KUCOIN + OKX) — Auto + Telegram
-# - Dark theme
-# - 6 Kapı (TF 15m + HTF 1h)
-# - STRONG: KAPI==6 AND (SKOR>=90 LONG / SKOR<=10 SHORT)
-# - Score step: 5
-# - Table: 20 rows (BOTH first)
-# - Telegram:
-#   * STRONG gelince anında mesaj (cooldown)
-#   * 20 dakikada bir rapor (STRONG yoksa bile)
-# =========================================================
-
+# =============================
+# SABİT AYARLAR (MANUEL YOK)
+# =============================
 IST = ZoneInfo("Europe/Istanbul")
 
 TF = "15m"
 HTF = "1h"
 
-AUTO_REFRESH_SEC = 60           # sayfa yenileme
-REPORT_EVERY_MIN = 20           # 20 dk rapor
-ALERT_COOLDOWN_MIN = 30         # aynı sinyali spam yapmasın
+AUTO_REFRESH_SEC = 240  # 4 dakika
+TOP_N_PER_EXCHANGE = 150  # her borsada taranacak USDT spot sayısı
 
-TOP_PER_EX = 200                # kalite için 200
-TABLE_ROWS = 20
-FALLBACK_LONG = 10
-FALLBACK_SHORT = 10
-
-CANDLE_LIMIT = 220
-SMA_PERIOD = 20
+CANDLE_LIMIT = 200
+RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
-RSI_PERIOD = 14
+SMA_PERIOD = 20
 ADX_PERIOD = 14
 
 SCORE_STEP = 5
+
 STRONG_LONG_MIN = 90
 STRONG_SHORT_MAX = 10
 
-# kalite filtresi (çöp coin azaltır)
-MIN_QV_24H_USDT = 1_000_000
+# “Kalite” için: çok çöp coin gelmesin (likidite + spread)
+MIN_QV_USDT_24H = 200_000  # USDT (yaklaşık) — çok sert yaparsan tablo boşalır
+MAX_SPREAD_PCT = 0.30      # %0.30
 
-STABLE_BASES = {
-    "USDT", "USDC", "DAI", "TUSD", "USDP", "FDUSD", "BUSD", "PYUSD",
-    "EURC", "USDD", "USDG", "USDE", "FRAX", "LUSD", "SUSD", "USTC",
-}
+# “KAPI” mantığı: 6 kapıdan kaçını geçti?
+MIN_KAPI_FOR_TABLE = 4     # tablo aday eşiği (STRONG için 6 şart)
 
-ADX_MIN_TF = 18.0
-ADX_MIN_HTF = 15.0
-
-
-# -----------------------------
-# Telegram (stdlib only)
-# -----------------------------
-def telegram_send(token: str, chat_id: str, text: str, timeout: int = 12) -> tuple[bool, str]:
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        form = parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
-        req = request.Request(
-            url=url,
-            data=form,
-            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "sniper-pro"},
-            method="POST",
-        )
-        with request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-        return True, body[:200]
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+# Tablo boyutu
+TABLE_N = 20
+FALLBACK_LONG_N = 10
+FALLBACK_SHORT_N = 10
 
 
-def now_ist() -> datetime:
-    return datetime.now(IST)
+# =============================
+# İNDİKATÖR (pandas/numpy) — pandas_ta yok
+# =============================
+def sma(s: pd.Series, period: int) -> pd.Series:
+    return s.rolling(period, min_periods=period).mean()
 
-
-def can_send_report() -> bool:
-    last = st.session_state.get("tg_last_report")
-    if not last:
-        return True
-    try:
-        last_dt = datetime.fromisoformat(last)
-    except Exception:
-        return True
-    return now_ist() - last_dt >= timedelta(minutes=REPORT_EVERY_MIN)
-
-
-def mark_report_sent():
-    st.session_state["tg_last_report"] = now_ist().isoformat()
-
-
-def can_send_alert(key: str) -> bool:
-    # key like "BTC|STRONG_LONG"
-    last_map = st.session_state.get("tg_last_alert_map", {})
-    last = last_map.get(key)
-    if not last:
-        return True
-    try:
-        last_dt = datetime.fromisoformat(last)
-    except Exception:
-        return True
-    return now_ist() - last_dt >= timedelta(minutes=ALERT_COOLDOWN_MIN)
-
-
-def mark_alert_sent(key: str):
-    last_map = st.session_state.get("tg_last_alert_map", {})
-    last_map[key] = now_ist().isoformat()
-    st.session_state["tg_last_alert_map"] = last_map
-
-
-def telegram_enabled() -> bool:
-    return (
-        isinstance(TELEGRAM_BOT_TOKEN, str) and TELEGRAM_BOT_TOKEN.strip() and
-        isinstance(TELEGRAM_CHAT_ID, str) and TELEGRAM_CHAT_ID.strip() and
-        "PASTE_" not in TELEGRAM_BOT_TOKEN and "PASTE_" not in TELEGRAM_CHAT_ID
-    )
-
-
-# -----------------------------
-# Indicators (pure pandas/numpy)
-# -----------------------------
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period, min_periods=period).mean()
-
-
-def bollinger(series: pd.Series, period: int, n_std: float):
+def bollinger(series: pd.Series, period: int, n_std: float) -> Tuple[pd.Series, pd.Series, pd.Series]:
     mid = series.rolling(period, min_periods=period).mean()
     std = series.rolling(period, min_periods=period).std(ddof=0)
-    upper = mid + (n_std * std)
-    lower = mid - (n_std * std)
+    upper = mid + n_std * std
+    lower = mid - n_std * std
     return mid, upper, lower
-
 
 def rsi_wilder(series: pd.Series, period: int) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+    avg_gain = gain.ewm(alpha=1.0/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0/period, adjust=False, min_periods=period).mean()
+
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    out = 100.0 - (100.0 / (1.0 + rs))
-    return out.fillna(50.0)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
 
+def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    # Wilder ADX (basit ve stabil)
+    # True Range
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
 
-def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
     up_move = high.diff()
     down_move = -low.diff()
 
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    tr1 = (high - low).abs()
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr_sm = pd.Series(tr).ewm(alpha=1.0/period, adjust=False, min_periods=period).mean()
+    plus_sm = pd.Series(plus_dm, index=high.index).ewm(alpha=1.0/period, adjust=False, min_periods=period).mean()
+    minus_sm = pd.Series(minus_dm, index=high.index).ewm(alpha=1.0/period, adjust=False, min_periods=period).mean()
 
-    atr = tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    plus_di = 100.0 * pd.Series(plus_dm, index=high.index).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr.replace(0.0, np.nan)
-    minus_di = 100.0 * pd.Series(minus_dm, index=high.index).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr.replace(0.0, np.nan)
-
-    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)).fillna(0.0)
-    adx_v = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    return adx_v.fillna(0.0)
+    plus_di = 100.0 * (plus_sm / tr_sm.replace(0.0, np.nan))
+    minus_di = 100.0 * (minus_sm / tr_sm.replace(0.0, np.nan))
+    dx = 100.0 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan))
+    adx = dx.ewm(alpha=1.0/period, adjust=False, min_periods=period).mean()
+    return adx.fillna(0.0)
 
 
 def round_step(x: float, step: int) -> int:
-    return int(step * round(float(x) / step))
+    return int(np.clip(int(round(x / step) * step), 0, 100))
 
 
-# -----------------------------
-# Scoring + 6 gates
-# -----------------------------
-def raw_score_core(close: float, sma20_v: float, rsi_v: float, bb_low: float, bb_up: float) -> float:
-    score = 50.0
-    score += 20.0 if close > sma20_v else -20.0
-    if rsi_v < 35.0:
-        score += 40.0
-    elif rsi_v > 65.0:
-        score -= 40.0
-    if close <= bb_low:
-        score += 40.0
-    elif close >= bb_up:
-        score -= 40.0
-    return float(np.clip(score, 0.0, 100.0))
+# =============================
+# CCXT — Borsalar
+# =============================
+def make_kucoin() -> ccxt.kucoin:
+    return ccxt.kucoin({"enableRateLimit": True, "timeout": 20000})
+
+def make_okx() -> ccxt.okx:
+    return ccxt.okx({"enableRateLimit": True, "timeout": 20000})
 
 
-def direction_from_raw(raw: float) -> str:
-    return "LONG" if raw >= 50.0 else "SHORT"
-
-
-def gates_6(
-    direction: str,
-    close: float, sma20_v: float, rsi_v: float, bb_low: float, bb_up: float, adx_v: float,
-    h_close: float | None, h_sma20: float | None, h_rsi: float | None, h_adx: float | None
-) -> int:
-    g = 0
-
-    # 1) TF trend
-    if direction == "LONG" and close > sma20_v: g += 1
-    if direction == "SHORT" and close < sma20_v: g += 1
-
-    # 2) TF RSI sanity
-    if direction == "LONG" and rsi_v <= 55.0: g += 1
-    if direction == "SHORT" and rsi_v >= 45.0: g += 1
-
-    # 3) TF BB edge touch
-    if direction == "LONG" and close <= bb_low: g += 1
-    if direction == "SHORT" and close >= bb_up: g += 1
-
-    # 4) TF ADX
-    if adx_v >= ADX_MIN_TF: g += 1
-
-    # 5) HTF trend
-    if h_close is not None and h_sma20 is not None:
-        if direction == "LONG" and h_close > h_sma20: g += 1
-        if direction == "SHORT" and h_close < h_sma20: g += 1
-
-    # 6) HTF momentum + HTF ADX
-    ok_momo = False
-    if h_rsi is not None:
-        if direction == "LONG" and h_rsi <= 60.0: ok_momo = True
-        if direction == "SHORT" and h_rsi >= 40.0: ok_momo = True
-
-    ok_adx = False
-    if h_adx is not None and h_adx >= ADX_MIN_HTF:
-        ok_adx = True
-
-    if ok_momo and ok_adx:
-        g += 1
-
-    return g
-
-
-def is_strong(direction: str, skor: int, kapi: int) -> bool:
-    if kapi != 6:
-        return False
-    if direction == "LONG":
-        return skor >= STRONG_LONG_MIN
-    return skor <= STRONG_SHORT_MAX
-
-
-# -----------------------------
-# CCXT helpers
-# -----------------------------
-def make_exchange(name: str) -> ccxt.Exchange:
-    params = {"enableRateLimit": True, "timeout": 20000}
-    if name == "kucoin":
-        return ccxt.kucoin(params)
-    if name == "okx":
-        return ccxt.okx(params)
-    raise ValueError("unsupported exchange")
-
-
-def safe_load_markets(ex: ccxt.Exchange) -> dict:
+def safe_load_markets(ex: ccxt.Exchange) -> Dict:
     try:
         return ex.load_markets()
     except Exception:
         return {}
 
-
-def safe_fetch_tickers(ex: ccxt.Exchange, symbols: list[str]) -> dict:
+def safe_fetch_tickers(ex: ccxt.Exchange) -> Dict:
     try:
-        return ex.fetch_tickers(symbols)
+        return ex.fetch_tickers()
     except Exception:
-        try:
-            all_t = ex.fetch_tickers()
-            return {s: all_t.get(s) for s in symbols if s in all_t}
-        except Exception:
-            return {}
+        return {}
+
+def safe_fetch_ohlcv(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> Optional[List]:
+    try:
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception:
+        return None
 
 
-def compute_qv_24h(ticker: dict) -> float:
-    if not ticker or not isinstance(ticker, dict):
+def is_usdt_spot_market(m: dict) -> bool:
+    if not m:
+        return False
+    if not m.get("active", True):
+        return False
+    if not m.get("spot", False):
+        return False
+    quote = m.get("quote")
+    return quote == "USDT"
+
+
+def compute_qv_usdt(t: dict) -> float:
+    # quoteVolume çoğu borsada doğrudan quote (USDT) olur.
+    if not isinstance(t, dict):
         return 0.0
-    qv = ticker.get("quoteVolume")
+    qv = t.get("quoteVolume")
     if qv is not None:
         try:
             return float(qv)
         except Exception:
             pass
-    bv = ticker.get("baseVolume")
-    last = ticker.get("last")
+    # fallback: baseVolume * last
+    bv = t.get("baseVolume")
+    last = t.get("last")
     try:
         if bv is not None and last is not None:
             return float(bv) * float(last)
@@ -304,126 +167,214 @@ def compute_qv_24h(ticker: dict) -> float:
     return 0.0
 
 
-def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame | None:
+def compute_spread_pct(t: dict) -> float:
+    if not isinstance(t, dict):
+        return 999.0
+    bid = t.get("bid")
+    ask = t.get("ask")
     try:
-        o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not o or len(o) < 60:
-            return None
-        return pd.DataFrame(o, columns=["ts", "open", "high", "low", "close", "volume"])
+        bid = float(bid) if bid is not None else None
+        ask = float(ask) if ask is not None else None
+        if bid and ask and bid > 0:
+            return ((ask - bid) / bid) * 100.0
     except Exception:
-        return None
+        pass
+    return 999.0
 
 
-def get_usdt_spot_symbols(markets: dict) -> list[str]:
-    syms = []
-    for sym, m in markets.items():
-        if not m or not isinstance(m, dict):
-            continue
-        if not m.get("active", True):
-            continue
-        if not m.get("spot", False):
-            continue
-        if m.get("quote") != "USDT":
-            continue
-        base = m.get("base") or (sym.split("/")[0] if "/" in sym else "")
-        if str(base).upper() in STABLE_BASES:
-            continue
-        syms.append(sym)
-    return sorted(set(syms))
-
-
-def scan_exchange(exchange_name: str) -> tuple[pd.DataFrame, dict]:
-    ex = make_exchange(exchange_name)
+@st.cache_data(show_spinner=False, ttl=300)
+def get_top_usdt_symbols(exchange_name: str, top_n: int) -> Tuple[List[str], Dict]:
+    # exchange_name: "kucoin" | "okx"
+    ex = make_kucoin() if exchange_name == "kucoin" else make_okx()
     markets = safe_load_markets(ex)
-    syms = get_usdt_spot_symbols(markets)
+    tickers = safe_fetch_tickers(ex)
 
-    tickers = safe_fetch_tickers(ex, syms)
+    syms = []
+    scored = []
+    for sym, m in markets.items():
+        if not is_usdt_spot_market(m):
+            continue
+        t = tickers.get(sym, {})
+        qv = compute_qv_usdt(t)
+        scored.append((sym, qv))
 
-    ranked = []
-    for s in syms:
-        qv = compute_qv_24h(tickers.get(s) or {})
-        if qv >= MIN_QV_USDT_24H:
-            ranked.append((s, qv))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    syms = [s for s, _ in scored[:top_n]]
+    return syms, tickers
 
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    top_syms = [s for s, _ in ranked[:TOP_PER_EX]]
 
-    meta = {"universe": len(syms), "after_liq": len(ranked), "scanned": len(top_syms)}
+def calc_raw_and_kapi(df15: pd.DataFrame, df1h: pd.DataFrame, tkr: dict) -> Tuple[float, int, str]:
+    """
+    Tek RAW: 0..100 (0 strong short, 100 strong long)
+    KAPI: 0..6 (seçilen yön için kapılar)
+    YÖN: LONG/SHORT (RAW>=50 -> LONG, RAW<50 -> SHORT)
+    """
+
+    close15 = df15["close"].astype(float)
+    high15 = df15["high"].astype(float)
+    low15 = df15["low"].astype(float)
+
+    close1h = df1h["close"].astype(float)
+
+    sma20_15 = sma(close15, SMA_PERIOD)
+    sma20_1h = sma(close1h, SMA_PERIOD)
+    rsi15 = rsi_wilder(close15, RSI_PERIOD)
+    _, bb_up, bb_low = bollinger(close15, BB_PERIOD, BB_STD)
+    adx15 = adx_wilder(high15, low15, close15, ADX_PERIOD)
+
+    last = float(close15.iloc[-1])
+    last_sma15 = float(sma20_15.iloc[-1])
+    last_rsi = float(rsi15.iloc[-1])
+    last_bbu = float(bb_up.iloc[-1])
+    last_bbl = float(bb_low.iloc[-1])
+    last_adx = float(adx15.iloc[-1])
+    last_1h = float(close1h.iloc[-1])
+    last_sma1h = float(sma20_1h.iloc[-1])
+
+    if any(np.isnan([last, last_sma15, last_rsi, last_bbu, last_bbl, last_adx, last_1h, last_sma1h])):
+        return 50.0, 0, "LONG"
+
+    # ========== RAW skoru (simetrik) ==========
+    raw = 50.0
+
+    # Trend (15m)
+    raw += 15.0 if last > last_sma15 else -15.0
+
+    # HTF trend (1h)
+    raw += 15.0 if last_1h > last_sma1h else -15.0
+
+    # RSI momentum
+    if last_rsi < 35:
+        raw += 15.0
+    elif last_rsi > 65:
+        raw -= 15.0
+
+    # Bollinger konumu
+    if last <= last_bbl:
+        raw += 10.0
+    elif last >= last_bbu:
+        raw -= 10.0
+
+    # ADX kuvvet (trend yönüne hafif destek)
+    trend_sign = 1.0 if (last > last_sma15 and last_1h > last_sma1h) else (-1.0 if (last < last_sma15 and last_1h < last_sma1h) else 0.0)
+    if last_adx >= 18 and trend_sign != 0:
+        raw += 5.0 * trend_sign
+
+    raw = float(np.clip(raw, 0.0, 100.0))
+
+    # ========== YÖN ==========
+    direction = "LONG" if raw >= 50 else "SHORT"
+
+    # ========== 6 KAPI ==========
+    qv = compute_qv_usdt(tkr)
+    spread_pct = compute_spread_pct(tkr)
+
+    # Kapılar yön bazlı
+    # 1) Likidite
+    gate_liq = qv >= MIN_QV_USDT_24H
+
+    # 2) Spread
+    gate_spread = spread_pct <= MAX_SPREAD_PCT
+
+    # 3) ADX kuvvet
+    gate_adx = last_adx >= 18
+
+    # 4) Trend uyumu (15m + 1h aynı yön)
+    if direction == "LONG":
+        gate_trend = (last > last_sma15) and (last_1h > last_sma1h)
+    else:
+        gate_trend = (last < last_sma15) and (last_1h < last_sma1h)
+
+    # 5) RSI yön filtresi (LONG için aşırı satıma yakın, SHORT için aşırı alıma yakın)
+    if direction == "LONG":
+        gate_rsi = last_rsi <= 45
+    else:
+        gate_rsi = last_rsi >= 55
+
+    # 6) BB yakınlık filtresi
+    # LONG: alt banda yakın / altında, SHORT: üst banda yakın / üstünde
+    if direction == "LONG":
+        gate_bb = last <= (last_bbl * 1.01)
+    else:
+        gate_bb = last >= (last_bbu * 0.99)
+
+    kapi = int(sum([gate_liq, gate_spread, gate_adx, gate_trend, gate_rsi, gate_bb]))
+
+    return raw, kapi, direction
+
+
+def scan_exchange(name: str) -> Tuple[bool, pd.DataFrame]:
+    """
+    name: 'KUCOIN' veya 'OKX'
+    Çıktı df kolonları:
+    COIN, YÖN, RAW, SKOR, FİYAT, QV_24H, KAPI, STRONG, SOURCE
+    """
+    ex = make_kucoin() if name == "KUCOIN" else make_okx()
+    ex_name = "kucoin" if name == "KUCOIN" else "okx"
+
+    syms, tickers = get_top_usdt_symbols(ex_name, TOP_N_PER_EXCHANGE)
+    if not syms:
+        return False, pd.DataFrame()
 
     rows = []
-    for sym in top_syms:
-        df = fetch_ohlcv_df(ex, sym, TF, CANDLE_LIMIT)
-        if df is None:
+    total = len(syms)
+    prog = st.progress(0, text=f"{name}: hazırlanıyor…")
+    status = st.empty()
+
+    for i, sym in enumerate(syms, start=1):
+        prog.progress(int((i - 1) / total * 100), text=f"{name}: {i}/{total} • {sym}")
+        o15 = safe_fetch_ohlcv(ex, sym, TF, CANDLE_LIMIT)
+        o1h = safe_fetch_ohlcv(ex, sym, HTF, CANDLE_LIMIT)
+        if not o15 or not o1h:
+            continue
+        if len(o15) < max(SMA_PERIOD, BB_PERIOD, RSI_PERIOD, ADX_PERIOD) + 5:
+            continue
+        if len(o1h) < SMA_PERIOD + 5:
             continue
 
-        close = df["close"].astype(float)
-        high = df["high"].astype(float)
-        low = df["low"].astype(float)
+        df15 = pd.DataFrame(o15, columns=["ts", "open", "high", "low", "close", "volume"])
+        df1h = pd.DataFrame(o1h, columns=["ts", "open", "high", "low", "close", "volume"])
 
-        sma20_s = sma(close, SMA_PERIOD)
-        _, bb_up_s, bb_low_s = bollinger(close, BB_PERIOD, BB_STD)
-        rsi_s = rsi_wilder(close, RSI_PERIOD)
-        adx_s = adx(high, low, close, ADX_PERIOD)
+        tkr = tickers.get(sym, {})
+        raw, kapi, yon = calc_raw_and_kapi(df15, df1h, tkr)
 
-        last_close = float(close.iloc[-1])
-        last_sma20 = float(sma20_s.iloc[-1])
-        last_rsi = float(rsi_s.iloc[-1])
-        last_low = float(bb_low_s.iloc[-1])
-        last_up = float(bb_up_s.iloc[-1])
-        last_adx = float(adx_s.iloc[-1])
+        score = round_step(raw, SCORE_STEP)
+        last_price = float(df15["close"].astype(float).iloc[-1])
+        qv = compute_qv_usdt(tkr)
 
-        if any(np.isnan([last_sma20, last_rsi, last_low, last_up, last_adx])):
-            continue
+        strong = (kapi == 6) and ((raw >= STRONG_LONG_MIN) or (raw <= STRONG_SHORT_MAX))
 
-        raw = raw_score_core(last_close, last_sma20, last_rsi, last_low, last_up)
-        direction = direction_from_raw(raw)
-        skor = round_step(raw, SCORE_STEP)
+        coin = sym.replace("/USDT", "")
 
-        # HTF ALWAYS (for KAPI to reach 6)
-        h_close = h_sma20 = h_rsi = h_adx = None
-        dfh = fetch_ohlcv_df(ex, sym, HTF, CANDLE_LIMIT)
-        if dfh is not None:
-            hc = dfh["close"].astype(float)
-            hh = dfh["high"].astype(float)
-            hl = dfh["low"].astype(float)
-            hsma20 = sma(hc, SMA_PERIOD)
-            hrsi = rsi_wilder(hc, RSI_PERIOD)
-            hadx = adx(hh, hl, hc, ADX_PERIOD)
-            try:
-                h_close = float(hc.iloc[-1])
-                h_sma20 = float(hsma20.iloc[-1])
-                hv_rsi = float(hrsi.iloc[-1])
-                hv_adx = float(hadx.iloc[-1])
-                h_rsi = None if np.isnan(hv_rsi) else hv_rsi
-                h_adx = None if np.isnan(hv_adx) else hv_adx
-            except Exception:
-                h_close = h_sma20 = h_rsi = h_adx = None
-
-        kapi = gates_6(direction, last_close, last_sma20, last_rsi, last_low, last_up, last_adx, h_close, h_sma20, h_rsi, h_adx)
-        strong = is_strong(direction, int(skor), int(kapi))
-
-        qv = compute_qv_24h(tickers.get(sym))
-
-        base = sym.split("/")[0].strip().upper()
         rows.append(
             {
-                "YÖN": direction,
-                "COIN": base,
-                "SKOR": int(skor),
-                "FİYAT": float(last_close),
+                "YÖN": yon,
+                "COIN": coin,
+                "SKOR": int(score),
+                "FİYAT": float(last_price),
                 "RAW": int(round(raw)),
                 "QV_24H": float(qv),
                 "KAPI": int(kapi),
                 "STRONG": bool(strong),
-                "EX": exchange_name.upper(),
+                "SOURCE": name,
             }
         )
-        time.sleep(0.01)
 
-    return pd.DataFrame(rows), meta
+        time.sleep(0.02)
+
+    prog.progress(100, text=f"{name}: bitti.")
+    status.empty()
+
+    df = pd.DataFrame(rows)
+    return True, df
 
 
 def merge_sources(df_k: pd.DataFrame, df_o: pd.DataFrame) -> pd.DataFrame:
+    """
+    KUCOIN + OKX birleştir:
+    - Aynı COIN iki borsada varsa SOURCE='BOTH' ve RAW/SKOR ortalama, KAPI min (daha sıkı)
+    - Diğerleri kendi SOURCE’u ile kalır
+    """
     if df_k is None:
         df_k = pd.DataFrame()
     if df_o is None:
@@ -432,163 +383,242 @@ def merge_sources(df_k: pd.DataFrame, df_o: pd.DataFrame) -> pd.DataFrame:
     if df_k.empty and df_o.empty:
         return pd.DataFrame()
 
-    # mark SOURCE= BOTH if coin appears on both
-    coins_k = set(df_k["COIN"].tolist()) if not df_k.empty else set()
-    coins_o = set(df_o["COIN"].tolist()) if not df_o.empty else set()
-    both = coins_k.intersection(coins_o)
+    # index by coin
+    k = df_k.set_index("COIN") if not df_k.empty else pd.DataFrame().set_index(pd.Index([], name="COIN"))
+    o = df_o.set_index("COIN") if not df_o.empty else pd.DataFrame().set_index(pd.Index([], name="COIN"))
 
-    def add_source(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        out = df.copy()
-        out["SOURCE"] = np.where(out["COIN"].isin(both), "BOTH", out["EX"])
-        return out.drop(columns=["EX"], errors="ignore")
+    coins = sorted(set(k.index.tolist()) | set(o.index.tolist()))
+    out_rows = []
 
-    all_df = pd.concat([add_source(df_k), add_source(df_o)], ignore_index=True)
+    for coin in coins:
+        in_k = coin in k.index
+        in_o = coin in o.index
 
-    # keep best row per coin (quality)
-    src_rank = {"BOTH": 0, "KUCOIN": 1, "OKX": 2}
-    tmp = all_df.copy()
-    tmp["__src_rank"] = tmp["SOURCE"].map(src_rank).fillna(9).astype(int)
-    tmp["__strong_rank"] = tmp["STRONG"].astype(bool).astype(int)
-    tmp["__score_rank"] = np.where(tmp["YÖN"].eq("SHORT"), tmp["SKOR"].astype(int), -tmp["SKOR"].astype(int))
+        if in_k and in_o:
+            rk = float(k.loc[coin, "RAW"])
+            ro = float(o.loc[coin, "RAW"])
+            raw = (rk + ro) / 2.0
 
-    tmp = tmp.sort_values(
-        ["__strong_rank", "__src_rank", "KAPI", "__score_rank", "QV_24H"],
-        ascending=[False, True, False, True, False],
-        kind="mergesort",
+            score = round_step(raw, SCORE_STEP)
+            # yön: ortalama raw
+            yon = "LONG" if raw >= 50 else "SHORT"
+
+            # KAPI: daha sıkı olmak için min
+            kapi = int(min(int(k.loc[coin, "KAPI"]), int(o.loc[coin, "KAPI"])))
+
+            # STRONG: KAPI=6 ve eşik
+            strong = (kapi == 6) and ((raw >= STRONG_LONG_MIN) or (raw <= STRONG_SHORT_MAX))
+
+            # fiyat: kucoin fiyatı (varsa) yoksa okx
+            price = float(k.loc[coin, "FİYAT"])
+            qv = float(k.loc[coin, "QV_24H"]) + float(o.loc[coin, "QV_24H"])
+
+            out_rows.append(
+                {
+                    "YÖN": yon,
+                    "COIN": coin,
+                    "SKOR": int(score),
+                    "FİYAT": float(price),
+                    "RAW": int(round(raw)),
+                    "QV_24H": float(qv),
+                    "KAPI": int(kapi),
+                    "STRONG": bool(strong),
+                    "SOURCE": "BOTH",
+                }
+            )
+        elif in_k:
+            row = k.loc[coin].to_dict()
+            row["COIN"] = coin
+            out_rows.append(row)
+        else:
+            row = o.loc[coin].to_dict()
+            row["COIN"] = coin
+            out_rows.append(row)
+
+    df = pd.DataFrame(out_rows)
+
+    # Tip düzelt
+    for c in ["SKOR", "RAW", "KAPI"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    df["QV_24H"] = pd.to_numeric(df["QV_24H"], errors="coerce").fillna(0.0).astype(float)
+    df["FİYAT"] = pd.to_numeric(df["FİYAT"], errors="coerce").fillna(0.0).astype(float)
+    df["STRONG"] = df["STRONG"].astype(bool)
+    df["YÖN"] = df["YÖN"].astype(str)
+    df["SOURCE"] = df["SOURCE"].astype(str)
+
+    return df
+
+
+def build_table(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    """
+    Tablo mantığı:
+    1) STRONG varsa önce STRONG’ları koy.
+    2) Kalan boşlukları TOP adaylarla doldur.
+    3) STRONG yoksa: 10 LONG + 10 SHORT (KAPI>=MIN_KAPI_FOR_TABLE) en yakın adaylar.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), "Aday yok (network/KuCoin/OKX veya filtre çok sert). Bir sonraki auto refresh’i bekle."
+
+    # Aday eşiği
+    cand = df[df["KAPI"] >= MIN_KAPI_FOR_TABLE].copy()
+    if cand.empty:
+        return pd.DataFrame(), "Aday yok (filtre çok sert). Bir sonraki auto refresh’i bekle."
+
+    # Strong set
+    strongs = cand[cand["STRONG"] == True].copy()
+
+    # yardımcı sıralama: BOTH üstte, sonra strong, sonra skor
+    def source_rank(x: str) -> int:
+        return 2 if x == "BOTH" else (1 if x in ("KUCOIN", "OKX") else 0)
+
+    cand["SRC_R"] = cand["SOURCE"].apply(source_rank)
+    strongs["SRC_R"] = strongs["SOURCE"].apply(source_rank)
+
+    # Long/Short ayrımı
+    longs = cand[cand["YÖN"] == "LONG"].copy()
+    shorts = cand[cand["YÖN"] == "SHORT"].copy()
+
+    # “en yakın” mantığı:
+    # long: RAW büyük olanlar; short: RAW küçük olanlar
+    longs = longs.sort_values(["SRC_R", "RAW"], ascending=[False, False])
+    shorts = shorts.sort_values(["SRC_R", "RAW"], ascending=[False, True])
+
+    if not strongs.empty:
+        # strongları önce koy
+        strongs = strongs.sort_values(["SRC_R", "RAW"], ascending=[False, False])
+
+        used = set()
+        out = []
+        for _, r in strongs.iterrows():
+            key = (r["COIN"], r["SOURCE"])
+            if key in used:
+                continue
+            out.append(r)
+            used.add(key)
+            if len(out) >= TABLE_N:
+                break
+
+        # kalan boşlukları “TOP adaylarla” doldur:
+        # önce BOTH + long, BOTH + short karışık, sonra diğerleri
+        fill = pd.concat([longs, shorts], ignore_index=True)
+        for _, r in fill.iterrows():
+            if len(out) >= TABLE_N:
+                break
+            key = (r["COIN"], r["SOURCE"])
+            if key in used:
+                continue
+            out.append(r)
+            used.add(key)
+
+        out_df = pd.DataFrame(out).drop(columns=["SRC_R"], errors="ignore").reset_index(drop=True)
+        return out_df, "✅ STRONG bulundu. Kalan boşluklar TOP adaylarla dolduruldu."
+
+    # STRONG yoksa: 10 long + 10 short zorunlu
+    pick_l = longs.head(FALLBACK_LONG_N)
+    pick_s = shorts.head(FALLBACK_SHORT_N)
+
+    out_df = pd.concat([pick_l, pick_s], ignore_index=True)
+
+    # eğer bir taraf boş kaldıysa, kalanını diğer taraftan doldur (yine de 20 satır)
+    if len(out_df) < TABLE_N:
+        rem = TABLE_N - len(out_df)
+        rest = pd.concat([longs.iloc[len(pick_l):], shorts.iloc[len(pick_s):]], ignore_index=True)
+        out_df = pd.concat([out_df, rest.head(rem)], ignore_index=True)
+
+    out_df = out_df.drop(columns=["SRC_R"], errors="ignore").reset_index(drop=True)
+    return out_df, "⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu."
+
+
+# =============================
+# STYLES (Koyu tema + renklendirme)
+# =============================
+def inject_css():
+    st.markdown(
+        """
+<style>
+html, body, [class*="css"] { background-color:#0b0f14 !important; color:#e6edf3 !important; }
+.block-container { padding-top: 1.0rem; }
+[data-testid="stHeader"] { background: rgba(0,0,0,0); }
+[data-testid="stSidebar"] { display:none; } /* sidebar yok */
+
+h1,h2,h3,h4,h5,h6,p,span,div { color:#e6edf3 !important; }
+.stProgress > div > div { background-color:#2563eb !important; }
+
+.card {
+  background:#0f172a;
+  border:1px solid #1f2a37;
+  border-radius:14px;
+  padding:14px 16px;
+}
+.badge-ok { background:#064e3b; border:1px solid #0f766e; }
+.badge-warn { background:#3f3f10; border:1px solid #6b6b1a; }
+.badge-info { background:#0b2440; border:1px solid #1f2a37; }
+.badge {
+  border-radius:14px;
+  padding:12px 14px;
+  font-weight:700;
+}
+.small { opacity:0.9; font-size: 12px; }
+</style>
+""",
+        unsafe_allow_html=True,
     )
 
-    tmp = tmp.drop_duplicates(subset=["COIN"], keep="first").drop(columns=["__src_rank", "__strong_rank", "__score_rank"])
-    return tmp.reset_index(drop=True)
 
-
-def build_table(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    df = df.copy()
-    strong = df[df["STRONG"].astype(bool)].copy()
-    non = df[~df["STRONG"].astype(bool)].copy()
-
-    if not strong.empty:
-        # strong first, but keep size TABLE_ROWS
-        src_rank = {"BOTH": 0, "KUCOIN": 1, "OKX": 2}
-        strong["__src_rank"] = strong["SOURCE"].map(src_rank).fillna(9).astype(int)
-        strong = strong.sort_values(["__src_rank", "KAPI", "QV_24H"], ascending=[True, False, False]).drop(columns=["__src_rank"])
-        out = strong.head(TABLE_ROWS)
-
-        if len(out) < TABLE_ROWS:
-            need = TABLE_ROWS - len(out)
-            non["__src_rank"] = non["SOURCE"].map(src_rank).fillna(9).astype(int)
-            non["__score_rank"] = np.where(non["YÖN"].eq("SHORT"), non["SKOR"].astype(int), -non["SKOR"].astype(int))
-            non = non.sort_values(["__src_rank", "KAPI", "__score_rank", "QV_24H"], ascending=[True, False, True, False]).drop(columns=["__src_rank", "__score_rank"])
-            out = pd.concat([out, non.head(need)], ignore_index=True)
-
-        return out.reset_index(drop=True)
-
-    # No STRONG: fallback 10+10
-    longs = df[df["YÖN"].eq("LONG")].sort_values(["SKOR", "KAPI", "QV_24H"], ascending=[False, False, False]).head(FALLBACK_LONG)
-    shorts = df[df["YÖN"].eq("SHORT")].sort_values(["SKOR", "KAPI", "QV_24H"], ascending=[True, False, False]).head(FALLBACK_SHORT)
-    out = pd.concat([longs, shorts], ignore_index=True)
-
-    # BOTH top
-    src_rank = {"BOTH": 0, "KUCOIN": 1, "OKX": 2}
-    out["__src_rank"] = out["SOURCE"].map(src_rank).fillna(9).astype(int)
-    out["__score_rank"] = np.where(out["YÖN"].eq("SHORT"), out["SKOR"].astype(int), -out["SKOR"].astype(int))
-    out = out.sort_values(["__src_rank", "KAPI", "__score_rank", "QV_24H"], ascending=[True, False, True, False]).drop(columns=["__src_rank", "__score_rank"])
-    return out.head(TABLE_ROWS).reset_index(drop=True)
-
-
-# -----------------------------
-# Styling (dark) — keep base look
-# -----------------------------
 def style_table(df: pd.DataFrame):
-    def row_style(row: pd.Series):
+    # Streamlit/pandas Styler dönüşünde type annotation KULLANMIYORUZ (Cloud’da patlamasın)
+    def row_bg(row):
         yon = str(row.get("YÖN", ""))
         strong = bool(row.get("STRONG", False))
-        source = str(row.get("SOURCE", ""))
+        src = str(row.get("SOURCE", ""))
 
-        # LONG green / SHORT red
+        # base renkler
         if yon == "LONG":
-            base = "rgba(6,78,59,0.35)"
-            strong_bg = "#064e3b"
-            both_bg = "#043227"
+            base = "#064e3b"  # yeşil
+            strong_col = "#053a2c"  # daha koyu
         else:
-            base = "rgba(127,29,29,0.35)"
-            strong_bg = "#7f1d1d"
-            both_bg = "#4a0f0f"
+            base = "#7f1d1d"  # kırmızı
+            strong_col = "#5a1414"  # daha koyu
 
-        bg = strong_bg if strong else base
-        if source == "BOTH":
-            bg = both_bg
+        # BOTH ise bir tık daha “premium” koyuluk
+        if src == "BOTH":
+            base = "#0b3a30" if yon == "LONG" else "#5a1010"
+            strong_col = "#072a22" if yon == "LONG" else "#400b0b"
 
-        return [f"background-color: {bg}; color: #e6edf3; font-weight: 700;"] * len(row)
+        bg = strong_col if strong else base
+        return [f"background-color: {bg}; color: #ffffff;"] * len(row)
 
     fmt = {
         "FİYAT": "{:.6f}",
         "QV_24H": "{:,.0f}",
-        "RAW": "{:.0f}",
-        "SKOR": "{:.0f}",
-        "KAPI": "{:.0f}",
+        "RAW": "{:d}",
+        "SKOR": "{:d}",
+        "KAPI": "{:d}",
     }
-    return df.style.format(fmt).apply(row_style, axis=1).set_properties(**{"border-color": "#1f2a37"})
 
-
-# -----------------------------
-# Telegram formatting
-# -----------------------------
-def format_report(df_show: pd.DataFrame) -> str:
-    lines = []
-    lines.append(f"📊 Gözcü Raporu (KuCoin+OKX) — {now_ist().strftime('%Y-%m-%d %H:%M:%S')} (IST)")
-    lines.append(f"TF={TF}, HTF={HTF} | STRONG: KAPI=6 & (>=90 / <=10)")
-    lines.append("")
-    for _, r in df_show.iterrows():
-        yon = r["YÖN"]
-        coin = r["COIN"]
-        skor = int(r["SKOR"])
-        kapi = int(r["KAPI"])
-        src = r["SOURCE"]
-        strong = "🔥" if bool(r["STRONG"]) and yon == "LONG" else ("💀" if bool(r["STRONG"]) and yon == "SHORT" else "⏳")
-        lines.append(f"{strong} {yon:<5} {coin:<10} SKOR={skor:<3} KAPI={kapi} SRC={src}")
-    return "\n".join(lines)[:3900]
-
-
-def format_strong_alert(row: pd.Series) -> tuple[str, str]:
-    yon = row["YÖN"]
-    coin = row["COIN"]
-    skor = int(row["SKOR"])
-    kapi = int(row["KAPI"])
-    src = row["SOURCE"]
-    tag = "🔥 STRONG LONG" if yon == "LONG" else "💀 STRONG SHORT"
-    key = f"{coin}|{tag}"
-    text = (
-        f"{tag}\n"
-        f"COIN: {coin}\n"
-        f"SRC: {src}\n"
-        f"SKOR: {skor}\n"
-        f"KAPI: {kapi}\n"
-        f"TF: {TF}  HTF: {HTF}\n"
-        f"Time(IST): {now_ist().strftime('%Y-%m-%d %H:%M:%S')}"
+    return (
+        df.style.format(fmt)
+        .apply(row_bg, axis=1)
+        .set_properties(**{
+            "border-color": "#1f2a37",
+            "border-style": "solid",
+            "border-width": "1px",
+            "font-weight": "600"
+        })
     )
-    return key, text
 
 
-def now_ist() -> datetime:
-    return datetime.now(IST)
+# =============================
+# APP
+# =============================
+st.set_page_config(page_title="Sniper — Auto (LONG + SHORT)", layout="wide")
+inject_css()
 
+st.title("🎯 Sniper — Auto (LONG + SHORT)")
+st.caption(f"TF={TF} • HTF={HTF} • STRONG: SKOR≥{STRONG_LONG_MIN} (LONG) / SKOR≤{STRONG_SHORT_MAX} (SHORT) • 6 Kapı • Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s")
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.title("🎯 KuCoin PRO Sniper — Auto (LONG + SHORT) + Telegram")
-st.caption(f"TF={TF} • HTF={HTF} • Auto refresh={AUTO_REFRESH_SEC}s • Report={REPORT_EVERY_MIN}m • Cooldown={ALERT_COOLDOWN_MIN}m")
-st.markdown(f"**İstanbul Time:** {now_ist().strftime('%Y-%m-%d %H:%M:%S')}")
-
-if "tg_last_report" not in st.session_state:
-    st.session_state["tg_last_report"] = None
-if "tg_last_alert_map" not in st.session_state:
-    st.session_state["tg_last_alert_map"] = {}
+now = datetime.now(IST)
+st.markdown(f"<div class='small'>İstanbul Time: <b>{now.strftime('%Y-%m-%d %H:%M:%S')}</b></div>", unsafe_allow_html=True)
 
 # Auto refresh
 try:
@@ -599,82 +629,60 @@ except Exception:
     except Exception:
         pass
 
-# Scan
-progress = st.progress(0, text="Başlıyor…")
-status = st.empty()
+# Bağlantı test kartları + tarama
+colA, colB = st.columns(2)
+with colA:
+    st.markdown("<div class='card badge badge-ok'>KuCoin: ✅ Bağlandı</div>", unsafe_allow_html=True)
+with colB:
+    st.markdown("<div class='card badge badge-ok'>OKX: ✅ Bağlandı</div>", unsafe_allow_html=True)
 
-with st.spinner("KuCoin + OKX taranıyor…"):
-    t0 = time.time()
+# Tarama
+spinner = st.empty()
+with spinner:
+    st.markdown("<div class='small'>Taranıyor…</div>", unsafe_allow_html=True)
 
-    # KuCoin
-    df_k = pd.DataFrame()
-    meta_k = {"universe": 0, "after_liq": 0, "scanned": 0}
-    try:
-        status.info("KuCoin taranıyor…")
-        df_k, meta_k = scan_exchange("kucoin")
-    except Exception:
-        pass
-    progress.progress(50, text="KuCoin tamam…")
+ok_k, df_k = scan_exchange("KUCOIN")
+ok_o, df_o = scan_exchange("OKX")
 
-    # OKX
-    df_o = pd.DataFrame()
-    meta_o = {"universe": 0, "after_liq": 0, "scanned": 0}
-    try:
-        status.info("OKX taranıyor…")
-        df_o, meta_o = scan_exchange("okx")
-    except Exception:
-        pass
-    progress.progress(85, text="OKX tamam…")
+spinner.empty()
+st.markdown("<div class='small'>Tarama bitti ✅</div>", unsafe_allow_html=True)
 
-    status.info("Birleştiriliyor…")
-    df_all = merge_sources(df_k, df_o)
-    df_show = build_table(df_all)
+df_all = merge_sources(df_k, df_o)
+df_show, status_msg = build_table(df_all)
 
-    progress.progress(100, text="Bitti ✅")
-    status.empty()
-
-elapsed = int(max(1, time.time() - t0))
-
-# Counters
+# Sayımlar
 if df_show is None or df_show.empty:
-    st.warning("Aday yok. Bir sonraki yenilemeyi bekle.")
-    st.stop()
-
-strong_long = int(((df_show["YÖN"] == "LONG") & (df_show["STRONG"] == True)).sum())
-strong_short = int(((df_show["YÖN"] == "SHORT") & (df_show["STRONG"] == True)).sum())
-longs = int((df_show["YÖN"] == "LONG").sum())
-shorts = int((df_show["YÖN"] == "SHORT").sum())
-
-st.info(f"✅ STRONG LONG: {strong_long} | 💀 STRONG SHORT: {strong_short} | LONG: {longs} | SHORT: {shorts}")
-
-evren_total = int(meta_k.get("universe", 0)) + int(meta_o.get("universe", 0))
-after_liq = int(meta_k.get("after_liq", 0)) + int(meta_o.get("after_liq", 0))
-scanned = int(meta_k.get("scanned", 0)) + int(meta_o.get("scanned", 0))
-st.caption(f"Evren: {evren_total} • Likidite sonrası: {after_liq} • Tarama: {scanned} • Süre: {elapsed}s")
-
-# Telegram send logic
-if telegram_enabled():
-    # Instant strong alerts (cooldown protected)
-    strong_rows = df_show[df_show["STRONG"] == True].copy()
-    if not strong_rows.empty:
-        for _, row in strong_rows.iterrows():
-            key, msg = format_strong_alert(row)
-            if can_send_alert(key):
-                ok, _ = telegram_send(TELEGRAM_BOT_TOKEN.strip(), TELEGRAM_CHAT_ID.strip(), msg)
-                if ok:
-                    mark_alert_sent(key)
-
-    # 20 min report
-    if can_send_report():
-        rep = format_report(df_show)
-        ok, _ = telegram_send(TELEGRAM_BOT_TOKEN.strip(), TELEGRAM_CHAT_ID.strip(), rep)
-        if ok:
-            mark_report_sent()
+    strong_long = strong_short = long_n = short_n = 0
 else:
-    st.warning("Telegram kapalı: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID doldur (dosyanın en üstünde).")
+    strong_long = int(((df_show["YÖN"] == "LONG") & (df_show["STRONG"] == True)).sum())
+    strong_short = int(((df_show["YÖN"] == "SHORT") & (df_show["STRONG"] == True)).sum())
+    long_n = int((df_show["YÖN"] == "LONG").sum())
+    short_n = int((df_show["YÖN"] == "SHORT").sum())
 
-# Show table
-st.subheader("📋 SNIPER TABLO (Top 20)")
-cols = ["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI", "STRONG", "SOURCE"]
-df_out = df_show.loc[:, cols].copy()
-st.dataframe(style_table(df_out), use_container_width=True, height=680)
+# Durum kartı
+if status_msg.startswith("✅"):
+    st.markdown(f"<div class='card badge badge-ok'>✅ {status_msg}</div>", unsafe_allow_html=True)
+elif status_msg.startswith("⚠️"):
+    st.markdown(f"<div class='card badge badge-warn'>⚠️ {status_msg}</div>", unsafe_allow_html=True)
+else:
+    st.markdown(f"<div class='card badge badge-warn'>⚠️ {status_msg}</div>", unsafe_allow_html=True)
+
+# Sayım kartı
+st.markdown(
+    f"""
+<div class='card badge badge-info'>
+✅ STRONG LONG: <b>{strong_long}</b> &nbsp;|&nbsp; 💀 STRONG SHORT: <b>{strong_short}</b> &nbsp;|&nbsp;
+LONG: <b>{long_n}</b> &nbsp;|&nbsp; SHORT: <b>{short_n}</b>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+st.subheader("🎯 SNIPER TABLO")
+
+if df_show is None or df_show.empty:
+    st.info("Aday yok. Bir sonraki yenilemeyi bekle.")
+else:
+    # Görünüm kolon sırası (senin ekranına uygun)
+    df_show = df_show[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI", "STRONG", "SOURCE"]].copy()
+    st.dataframe(style_table(df_show), use_container_width=True, height=720)
