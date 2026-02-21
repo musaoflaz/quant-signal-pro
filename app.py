@@ -172,10 +172,8 @@ def is_junk_symbol(base: str) -> bool:
         "USDT","USDC","BUSD","TUSD","DAI","FDUSD","USDP","EUR","EURT",
         "3S","3L","5S","5L","BULL","BEAR","UP","DOWN"
     }
-    # base "BTC" vb.
     if b in junk:
         return True
-    # bazı borsalarda "XYZ3L" gibi
     for suf in ["3L","3S","5L","5S","BULL","BEAR","UP","DOWN"]:
         if b.endswith(suf):
             return True
@@ -210,9 +208,6 @@ def load_markets_safe(ex, name: str) -> bool:
 
 
 def fetch_top_usdt_symbols(ex, ex_name: str, top_n: int) -> list[str]:
-    """
-    Top USDT spot pairs by 24h quote volume if possible.
-    """
     try:
         tickers = ex.fetch_tickers()
     except Exception:
@@ -227,14 +222,12 @@ def fetch_top_usdt_symbols(ex, ex_name: str, top_n: int) -> list[str]:
         if is_junk_symbol(base):
             continue
 
-        # volume
         qv = safe_float(t.get("quoteVolume"), 0.0)
         last = safe_float(t.get("last"), 0.0)
         basev = safe_float(t.get("baseVolume"), 0.0)
         if qv <= 0 and basev > 0 and last > 0:
             qv = basev * last
 
-        # spread
         bid = safe_float(t.get("bid"), 0.0)
         ask = safe_float(t.get("ask"), 0.0)
         spread_pct = 999.0
@@ -268,14 +261,6 @@ def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200) -> pd.Data
 # SCORING (6 gates)
 # =========================
 def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
-    """
-    Returns:
-      direction: LONG/SHORT
-      raw: 0..100
-      score: 0..100 (stepped)
-      gates: 0..6
-      rsi, adx, atr_spike, bb_pos, sma20_dist, htf_ok
-    """
     h = df["high"].to_numpy(dtype=float)
     l = df["low"].to_numpy(dtype=float)
     c = df["close"].to_numpy(dtype=float)
@@ -293,26 +278,18 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
 
     last = c[-1]
 
-    # Direction heuristic:
-    # - LONG if price above SMA20 and RSI >= 50
-    # - SHORT if price below SMA20 and RSI < 50
     direction = "LONG" if (last >= s20[-1] and r[-1] >= 50) else "SHORT"
 
     gates = 0
 
-    # Gate 1: RSI bias
     if direction == "LONG" and r[-1] >= 55:
         gates += 1
     if direction == "SHORT" and r[-1] <= 45:
         gates += 1
 
-    # Gate 2: ADX trend strength
     if a[-1] >= 18:
         gates += 1
 
-    # Gate 3: BB position (avoid mid noise)
-    # LONG: closer to lower->mid bounce OR above mid with strength
-    # SHORT: closer to upper->mid rejection OR below mid with weakness
     if direction == "LONG":
         if last <= mid[-1] or last >= mid[-1] * 1.002:
             gates += 1
@@ -320,21 +297,17 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
         if last >= mid[-1] or last <= mid[-1] * 0.998:
             gates += 1
 
-    # Gate 4: SMA20 distance (momentum)
     sma_dist_pct = (last - s20[-1]) / s20[-1] * 100 if s20[-1] else 0.0
     if direction == "LONG" and sma_dist_pct >= 0.10:
         gates += 1
     if direction == "SHORT" and sma_dist_pct <= -0.10:
         gates += 1
 
-    # Gate 5: ATR spike (volatility expansion)
-    # compare last ATR to ATR EMA
     atr_ema = ema(at, 20)
     atr_spike = (at[-1] / atr_ema[-1]) if atr_ema[-1] and not np.isnan(atr_ema[-1]) else 1.0
     if atr_spike >= 1.05:
         gates += 1
 
-    # Gate 6: HTF confirmation (1h)
     htf_sma20 = sma(htf_c, 20)
     if not np.isnan(htf_sma20[-1]):
         if direction == "LONG" and htf_c[-1] >= htf_sma20[-1]:
@@ -342,14 +315,9 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
         if direction == "SHORT" and htf_c[-1] <= htf_sma20[-1]:
             gates += 1
 
-    # Raw score from gates (0..100)
     raw = (gates / 6) * 100.0
     score = step_score(raw, SCORE_STEP)
 
-    # For SHORT, we invert displayed "SKOR" logic to match your old style where SHORT can be low.
-    # If raw is high, it means strong conviction regardless direction.
-    # But your threshold logic says STRONG SHORT is score <= 10 (meaning "very bearish").
-    # To keep that behavior, we map SHORT score = 100 - score.
     disp_score = score if direction == "LONG" else (100 - score)
     disp_raw = int(round(raw)) if direction == "LONG" else int(round(100 - raw))
 
@@ -372,34 +340,60 @@ def strong_flag(direction: str, gates: int, score: int) -> bool:
 # =========================
 # TELEGRAM MESSAGE BUILDERS
 # =========================
-def format_signal_line(row: dict) -> str:
+def format_signal_line(row: dict, include_source: bool = True) -> str:
     coin = row["COIN"]
     score = int(row["SKOR"])
     direction = row["YÖN"]
     src = row["SOURCE"]
 
-    # emojis like your screenshot
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
-    return f"{coin}: <b>{score}</b> Puan | {dir_emoji} <b>{direction}</b>  <i>({src})</i>"
+    if include_source:
+        return f"{coin}: <b>{score}</b> Puan | {dir_emoji} <b>{direction}</b> (<b>{src}</b>)"
+    return f"{coin}: <b>{score}</b> Puan | {dir_emoji} <b>{direction}</b>"
 
 def tg_send_strong_alerts(strong_rows: list[dict]):
-    # send each strong as separate message (more “anında”)
+    """
+    ✅ STRONG SİNYAL
+    COIN: 100 Puan | 🟢 LONG (BOTH)
+    ...
+    ⏱ İstanbul: ....
+    """
+    if not strong_rows:
+        return
+
+    # LONG üstte, SHORT altta; skor büyükten küçüğe
+    def sort_key(r):
+        yon = (r.get("YÖN") or "").upper()
+        is_long = 1 if "LONG" in yon else 0
+        return (-is_long, -int(r.get("SKOR", 0)))
+
+    strong_rows = sorted(strong_rows, key=sort_key)
+
+    lines = []
+    lines.append("✅ <b>STRONG SİNYAL</b>")
     for r in strong_rows:
-        header = "✅ <b>STRONG SİNYAL</b>\n"
-        body = format_signal_line(r)
-        footer = f"\n\n⏱ İstanbul: <code>{now_istanbul_str()}</code>"
-        send_telegram_html(header + body + footer)
+        lines.append(format_signal_line(r, include_source=True))
+    lines.append("")
+    lines.append(f"⏱ İstanbul: <code>{now_istanbul_str()}</code>")
+
+    send_telegram_html("\n".join(lines))
 
 def tg_send_report(long_rows: list[dict], short_rows: list[dict]):
-    # like “Gözcü Raporu (L/S)” screenshot
+    """
+    📋 Gözcü Raporu (L/S)
+    COIN: 80 Puan | 🟢 LONG
+    COIN: 50 Puan | 🔴 SHORT
+    ⏱ İstanbul: ....
+    """
     lines = []
     lines.append("📋 <b>Gözcü Raporu (L/S)</b>")
-    lines.append(f"⏱ İstanbul: <code>{now_istanbul_str()}</code>")
     lines.append("")
     for r in long_rows:
-        lines.append("🟩 " + format_signal_line(r))
+        lines.append(format_signal_line(r, include_source=False))
     for r in short_rows:
-        lines.append("🟥 " + format_signal_line(r))
+        lines.append(format_signal_line(r, include_source=False))
+    lines.append("")
+    lines.append(f"⏱ İstanbul: <code>{now_istanbul_str()}</code>")
 
     send_telegram_html("\n".join(lines))
 
@@ -439,11 +433,9 @@ if tg_enabled():
 else:
     st.warning("Telegram: ❌ Secrets eksik. (TG_TOKEN / TG_CHAT_ID)")
 
-# If any exchange failed, stop early
 if not (ku_ok and ok_ok):
     st.stop()
 
-# Fetch top symbols
 with st.spinner("Marketler taranıyor (hacim/spread filtreleri uygulanıyor)..."):
     ku_syms = fetch_top_usdt_symbols(kucoin, "KuCoin", TOP_N_PER_EXCHANGE)
     ok_syms = fetch_top_usdt_symbols(okx, "OKX", TOP_N_PER_EXCHANGE)
@@ -451,10 +443,8 @@ with st.spinner("Marketler taranıyor (hacim/spread filtreleri uygulanıyor)..."
 ku_set = set(ku_syms)
 ok_set = set(ok_syms)
 
-# union scan list
 scan_list = sorted(list(ku_set.union(ok_set)))
 
-# Progress
 progress = st.progress(0, text=f"Taranıyor: 0/{len(scan_list)}")
 
 rows = []
@@ -465,7 +455,6 @@ for i, sym in enumerate(scan_list, start=1):
 
     base = sym.split("/")[0]
 
-    # per exchange score
     res_ku = None
     res_ok = None
 
@@ -481,13 +470,10 @@ for i, sym in enumerate(scan_list, start=1):
         if df is not None and dfh is not None:
             res_ok = score_symbol(df, dfh)
 
-    # decide combined
     source = None
     chosen = None
 
     if res_ku and res_ok:
-        # both available
-        # if direction matches => combine gates/score by min gates and average score
         if res_ku["direction"] == res_ok["direction"]:
             direction = res_ku["direction"]
             gates = min(res_ku["gates"], res_ok["gates"])
@@ -496,8 +482,6 @@ for i, sym in enumerate(scan_list, start=1):
             chosen = {"direction": direction, "gates": gates, "score": score, "raw": raw}
             source = "BOTH"
         else:
-            # divergence - keep stronger by gates then by raw distance
-            # but mark as BOTH (div)
             a = res_ku
             b = res_ok
             pick = a if a["gates"] > b["gates"] else b
@@ -512,7 +496,6 @@ for i, sym in enumerate(scan_list, start=1):
     else:
         continue
 
-    # last price + qv24h best-effort from tickers (fast enough)
     last_price = 0.0
     qv = 0.0
     try:
@@ -556,10 +539,6 @@ if df_all.empty:
     st.warning("Hiç aday çıkmadı. Filtreler çok sert olabilir (hacim/spread).")
     st.stop()
 
-# Sort priority:
-# 1) BOTH at top
-# 2) STRONG at top
-# 3) LONG before SHORT? (we will show mixed but keep strong first)
 df_all["_prio_source"] = (df_all["SOURCE"] == "BOTH").astype(int)
 df_all["_prio_strong"] = df_all["STRONG"].astype(int)
 df_all["_prio_dir"] = (df_all["YÖN"] == "LONG").astype(int)
@@ -569,24 +548,19 @@ df_all = df_all.sort_values(
     ascending=[False, False, False, False, False, False]
 ).drop(columns=["_prio_source", "_prio_strong", "_prio_dir"])
 
-# Counters
 strong_long = int(((df_all["STRONG"]) & (df_all["YÖN"] == "LONG") & (df_all["SOURCE"] == "BOTH")).sum())
 strong_short = int(((df_all["STRONG"]) & (df_all["YÖN"] == "SHORT") & (df_all["SOURCE"] == "BOTH")).sum())
 cnt_long = int((df_all["YÖN"] == "LONG").sum())
 cnt_short = int((df_all["YÖN"] == "SHORT").sum())
 
 st.markdown(f"**İstanbul Time:** `{now_istanbul_str()}`")
-
 st.success("Tarama bitti ✅")
-
 st.info(f"✅ STRONG LONG: {strong_long} | 💀 STRONG SHORT: {strong_short} | LONG: {cnt_long} | SHORT: {cnt_short}")
 
-# Decide table content (10 long + 10 short)
 df_long = df_all[df_all["YÖN"] == "LONG"].head(TABLE_N_LONG)
 df_short = df_all[df_all["YÖN"] == "SHORT"].head(TABLE_N_SHORT)
 df_show = pd.concat([df_long, df_short], ignore_index=True)
 
-# If no strong, fill message
 if strong_long + strong_short == 0:
     st.warning("⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu.")
 else:
@@ -602,7 +576,6 @@ st.dataframe(
 # =========================
 # TELEGRAM LOGIC
 # =========================
-# 1) STRONG (BOTH) -> instantly message (only NEW ones)
 new_strongs = []
 for r in strong_rows:
     key = f"{r['COIN']}|{r['YÖN']}|{r['SOURCE']}|{r['SKOR']}|{r['KAPI']}"
@@ -612,23 +585,23 @@ for r in strong_rows:
 
 if tg_enabled():
     if new_strongs:
-        # send strong alerts right now
+        # ✅ now sends ONE message, list format
         tg_send_strong_alerts(new_strongs)
     else:
-        # 2) No new strong -> every 20 min send report
         now_ts = time.time()
         if (now_ts - st.session_state.last_report_ts) >= (REPORT_EVERY_MIN * 60):
-            # Build report from table (like screenshot)
             rep_long = df_long.to_dict("records")
             rep_short = df_short.to_dict("records")
             tg_send_report(rep_long, rep_short)
             st.session_state.last_report_ts = now_ts
 
-# Small tools
 with st.expander("🧪 Telegram Test (İstersen)"):
     if tg_enabled():
         if st.button("Test Mesajı Gönder"):
-            ok = send_telegram_html("✅ <b>Sniper Gözcü</b> Telegram testi çalışıyor.\n⏱ İstanbul: <code>" + now_istanbul_str() + "</code>")
+            ok = send_telegram_html(
+                "✅ <b>Sniper Gözcü</b> Telegram testi çalışıyor.\n"
+                "⏱ İstanbul: <code>" + now_istanbul_str() + "</code>"
+            )
             st.success("Gönderildi ✅" if ok else "Gönderilemedi ❌")
     else:
         st.warning("Secrets yok: TG_TOKEN / TG_CHAT_ID eklemeden test olmaz.")
