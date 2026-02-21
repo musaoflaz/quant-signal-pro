@@ -686,36 +686,3 @@ else:
     # Görünüm kolon sırası (senin ekranına uygun)
     df_show = df_show[["YÖN", "COIN", "SKOR", "FİYAT", "RAW", "QV_24H", "KAPI", "STRONG", "SOURCE"]].copy()
     st.dataframe(style_table(df_show), use_container_width=True, height=720)
-# --- TELEGRAM VE OTOMATİK YENİLEME ( UI BOZULMADAN EKLENDİ ) ---
-st_autorefresh(interval=240 * 1000, key="bot_refresh")
-
-TG_TOKEN = "8330775219:AAHx20fZA6C3ONs5S8ELQrMpFEYba-bPN1k"
-TG_CHAT_ID = "1358384022"
-
-def send_telegram_msg(message):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except:
-        pass
-
-# Burada df_all senin orijinal birleşmiş tablo değişkenin olmalı
-try:
-    # Sadece her iki borsa onaylı ve STRONG sinyalleri yakalar
-    target_df = df_all 
-    alerts = target_df[(target_df["SOURCE"] == "BOTH") & (target_df["STRONG"] == True)]
-    
-    for _, row in alerts.iterrows():
-        emoji = "🚀 LONG" if row["YÖN"] == "LONG" else "💀 SHORT"
-        msg = (
-            f"🎯 <b>SNIPER SİNYAL</b>\n\n"
-            f"<b>Coin:</b> #{row['COIN']}\n"
-            f"<b>İşlem:</b> {emoji}\n"
-            f"<b>Skor:</b> {row['SKOR']}\n"
-            f"<b>Fiyat:</b> {row['FİYAT']}\n"
-            f"<b>Onay:</b> OKX + KuCoin ✅"
-        )
-        send_telegram_msg(msg)
-except:
-    pass
