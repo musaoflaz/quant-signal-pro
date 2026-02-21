@@ -313,7 +313,7 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame):
     if direction == "SHORT" and hc[-1] <= htf_sma20[-1]:
         gates += 1
 
-    # 6) BB / trend filtresi (koru)
+    # 6) BB / trend filtresi
     if direction == "LONG":
         if last >= mid[-1] * BB_LONG_MULT:
             gates += 1
@@ -328,7 +328,7 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame):
     raw = (gates / GATES_TOTAL) * 100.0
     score = step_score(raw, SCORE_STEP)
 
-    # SHORT display mapping: düşük skor = iyi short (eski mantık)
+    # SHORT: düşük skor = iyi short (eski mantık)
     disp_score = score if direction == "LONG" else (100 - score)
     disp_raw = int(round(raw)) if direction == "LONG" else int(round(100 - raw))
 
@@ -344,9 +344,9 @@ def strong_flag(gates: int) -> bool:
 
 
 # =========================
-# UI TABLE STYLE (FIXED!)
+# UI TABLE STYLE (NO TYPE HINTS -> FIX)
 # =========================
-def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+def style_table(df: pd.DataFrame):
     def row_style(row: pd.Series):
         direction = str(row.get("YÖN", ""))
         strong = bool(row.get("STRONG", False))
@@ -357,7 +357,6 @@ def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             bg = "#5b1b1b" if not strong else "#3b0f0f"
 
         css = f"background-color: {bg}; color: #e9f1ef; border-color: rgba(255,255,255,0.08);"
-        # !!! ÖNEMLİ: kolon sayısı kadar stil döndür (ValueError fix)
         return [css] * len(row)
 
     styler = df.style.apply(row_style, axis=1)
@@ -369,7 +368,6 @@ def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         ]
     )
 
-    # format
     fmt = {}
     if "FİYAT" in df.columns:
         fmt["FİYAT"] = "{:,.6f}"
