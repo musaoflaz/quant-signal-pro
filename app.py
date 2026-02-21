@@ -1,4 +1,4 @@
-# requirements.txt (install these):
+# requirements.txt:
 # streamlit
 # pandas
 # numpy
@@ -18,50 +18,45 @@ import ccxt
 
 
 # =========================
-# CONFIG (NO MANUAL SETTINGS)
+# CONFIG
 # =========================
 st.set_page_config(page_title="Sniper — Auto (LONG + SHORT)", layout="wide")
 
 TF = "15m"
 HTF = "1h"
 
-TOP_N_PER_EXCHANGE = 180          # KuCoin + OKX (likid filtre sonrası)
+TOP_N_PER_EXCHANGE = 180
 TABLE_N_LONG = 10
 TABLE_N_SHORT = 10
 
-AUTO_REFRESH_SEC = 240            # Streamlit auto refresh (test)
-REPORT_EVERY_MIN = 20             # STRONG yoksa rapor kaç dakikada bir Telegram
+AUTO_REFRESH_SEC = 240
+REPORT_EVERY_MIN = 20
 
-# 8/8 FULL SNIPER MOD (SERT)
+# FULL SERT (8/8)
 GATES_REQUIRED_STRONG = 8
-SCORE_STEP = 2                    # skor 2'şer
-STRONG_LONG_SCORE_MIN = 100        # 8/8 LONG -> 100
-STRONG_SHORT_SCORE_MAX = 0         # 8/8 SHORT -> 0
+SCORE_STEP = 2
+STRONG_LONG_SCORE_MIN = 100
+STRONG_SHORT_SCORE_MAX = 0
 
-# Likidite filtresi (çöp azaltma)
 MIN_QV_24H_USDT = 300_000
 MAX_SPREAD_PCT = 0.35
 
-# Telegram list max
 TG_MAX_LIST = 20
 
-# ccxt
 CCXT_RATE_LIMIT = True
 CANDLE_LIMIT = 220
 
 
 # =========================
-# DARK THEME (UI FIX)
+# UI (Dark)
 # =========================
 st.markdown(
     """
 <style>
-html, body, [class*="css"]  { background-color: #0b0f14 !important; }
+html, body, [class*="css"] { background-color: #0b0f14 !important; }
 .block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
-h1, h2, h3, h4, h5, h6, p, span, div, label { color: #e6edf3 !important; }
+h1,h2,h3,h4,h5,h6,p,span,div,label { color: #e6edf3 !important; }
 [data-testid="stHeader"] { background: rgba(0,0,0,0) !important; }
-[data-testid="stSidebar"] { display: none; }
-div[data-testid="stStatusWidget"] { display: none; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -174,7 +169,7 @@ def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
 # HELPERS
 # =========================
 def now_istanbul_str():
-    ts = datetime.now(timezone.utc).timestamp() + 3 * 3600  # IST fixed UTC+3
+    ts = datetime.now(timezone.utc).timestamp() + 3 * 3600
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -205,23 +200,8 @@ def is_usdt_spot_symbol(sym: str) -> bool:
 def is_junk_symbol(base: str) -> bool:
     b = base.upper()
     junk = {
-        "USDT",
-        "USDC",
-        "BUSD",
-        "TUSD",
-        "DAI",
-        "FDUSD",
-        "USDP",
-        "EUR",
-        "EURT",
-        "3S",
-        "3L",
-        "5S",
-        "5L",
-        "BULL",
-        "BEAR",
-        "UP",
-        "DOWN",
+        "USDT", "USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP", "EUR", "EURT",
+        "3S", "3L", "5S", "5L", "BULL", "BEAR", "UP", "DOWN"
     }
     if b in junk:
         return True
@@ -232,7 +212,7 @@ def is_junk_symbol(base: str) -> bool:
 
 
 def pct_change(a: float, b: float) -> float:
-    if a == 0 or a is None or b is None:
+    if a is None or b is None or a == 0:
         return 0.0
     return (b - a) / a * 100.0
 
@@ -242,20 +222,16 @@ def pct_change(a: float, b: float) -> float:
 # =========================
 @st.cache_resource(show_spinner=False)
 def get_exchanges():
-    kucoin = ccxt.kucoin(
-        {
-            "enableRateLimit": CCXT_RATE_LIMIT,
-            "timeout": 20000,
-            "options": {"defaultType": "spot"},
-        }
-    )
-    okx = ccxt.okx(
-        {
-            "enableRateLimit": CCXT_RATE_LIMIT,
-            "timeout": 20000,
-            "options": {"defaultType": "spot"},
-        }
-    )
+    kucoin = ccxt.kucoin({
+        "enableRateLimit": CCXT_RATE_LIMIT,
+        "timeout": 20000,
+        "options": {"defaultType": "spot"},
+    })
+    okx = ccxt.okx({
+        "enableRateLimit": CCXT_RATE_LIMIT,
+        "timeout": 20000,
+        "options": {"defaultType": "spot"},
+    })
     return kucoin, okx
 
 
@@ -319,53 +295,41 @@ def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = CANDLE_LIMIT) -
 
 
 # =========================
-# MARKET REGIME (BTC FILTER / INFO)
+# BTC REGIME (info only)
 # =========================
 def btc_regime(okx, kucoin) -> dict:
-    """
-    Professional advice: calculate BTC 1H regime.
-    We DO NOT block sides (B mode). We only label ALIGN and count "Aligned Strong".
-    """
     sym = "BTC/USDT"
     df = fetch_ohlcv_df(okx, sym, HTF, CANDLE_LIMIT)
     src = "OKX"
     if df is None:
         df = fetch_ohlcv_df(kucoin, sym, HTF, CANDLE_LIMIT)
         src = "KUCOIN"
-
     if df is None:
-        return {"src": "N/A", "state": "UNKNOWN", "close": np.nan, "sma20": np.nan, "rsi": np.nan}
+        return {"src": "N/A", "state": "UNKNOWN"}
 
     c = df["close"].to_numpy(dtype=float)
     s20 = sma(c, 20)
     r = rsi(c, 14)
+    if np.isnan(s20[-1]) or np.isnan(r[-1]):
+        return {"src": src, "state": "UNKNOWN"}
 
     last = float(c[-1])
-    last_sma = float(s20[-1]) if not np.isnan(s20[-1]) else np.nan
-    last_rsi = float(r[-1]) if not np.isnan(r[-1]) else np.nan
+    last_sma = float(s20[-1])
+    last_rsi = float(r[-1])
 
     state = "NEUTRAL"
-    if not np.isnan(last_sma) and not np.isnan(last_rsi):
-        if last > last_sma and last_rsi >= 50:
-            state = "BULL"
-        elif last < last_sma and last_rsi <= 50:
-            state = "BEAR"
+    if last > last_sma and last_rsi >= 50:
+        state = "BULL"
+    elif last < last_sma and last_rsi <= 50:
+        state = "BEAR"
 
-    return {"src": src, "state": state, "close": last, "sma20": last_sma, "rsi": last_rsi}
+    return {"src": src, "state": state}
 
 
 # =========================
-# SCORING (8 GATES - FULL SERT)
+# SCORING (8 GATES - SERT)
 # =========================
 def score_symbol_8gates(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
-    """
-    Returns dict:
-      direction: LONG/SHORT
-      gates: 0..8
-      raw: display raw (SHORT inverted)
-      score: display score stepped (SHORT inverted)
-      details: optional
-    """
     h = df["high"].to_numpy(dtype=float)
     l = df["low"].to_numpy(dtype=float)
     c = df["close"].to_numpy(dtype=float)
@@ -383,10 +347,7 @@ def score_symbol_8gates(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
     htf_sma20 = sma(hc, 20)
     htf_adx = adx(hh, hl, hc, 14)
 
-    if any(
-        np.isnan(x[-1])
-        for x in [r, a, mid, up, lowb, s20, at, htf_sma20, htf_adx]
-    ):
+    if any(np.isnan(x[-1]) for x in [r, a, mid, up, lowb, s20, at, htf_sma20, htf_adx]):
         return None
 
     last = float(c[-1])
@@ -402,64 +363,56 @@ def score_symbol_8gates(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
     last_htf_sma = float(htf_sma20[-1])
     last_htf_adx = float(htf_adx[-1])
 
-    # Direction heuristic (strict)
     direction = "LONG" if (last >= last_sma and last_rsi >= 50) else "SHORT"
 
     gates = 0
 
-    # Gate 1: RSI bias (strict)
+    # 1) RSI bias
     if direction == "LONG" and last_rsi >= 60:
         gates += 1
     if direction == "SHORT" and last_rsi <= 40:
         gates += 1
 
-    # Gate 2: ADX strength (strict)
+    # 2) ADX (TF)
     if last_adx >= 25:
         gates += 1
 
-    # Gate 3: Bollinger strength position (strict near band, away from mid)
-    # LONG: above mid and closer to upper band
-    # SHORT: below mid and closer to lower band
+    # 3) BB position (strict)
     if direction == "LONG":
-        if last >= last_mid * 1.003 and (last_up > last_mid) and ((last_up - last) / (last_up - last_mid + 1e-9) <= 0.35):
+        cond = (last >= last_mid * 1.003) and (last_up > last_mid) and ((last_up - last) / (last_up - last_mid + 1e-9) <= 0.35)
+        if cond:
             gates += 1
     else:
-        if last <= last_mid * 0.997 and (last_mid > last_low) and ((last - last_low) / (last_mid - last_low + 1e-9) <= 0.35):
+        cond = (last <= last_mid * 0.997) and (last_mid > last_low) and ((last - last_low) / (last_mid - last_low + 1e-9) <= 0.35)
+        if cond:
             gates += 1
 
-    # Gate 4: SMA20 momentum distance (strict)
+    # 4) SMA20 momentum distance
     sma_dist_pct = (last - last_sma) / (last_sma + 1e-9) * 100.0
     if direction == "LONG" and sma_dist_pct >= 0.35:
         gates += 1
     if direction == "SHORT" and sma_dist_pct <= -0.35:
         gates += 1
 
-    # Gate 5: ATR spike (strict)
+    # 5) ATR spike
     atr_ema = ema(at, 20)
     last_atr_ema = float(atr_ema[-1]) if not np.isnan(atr_ema[-1]) else np.nan
     atr_spike = (last_atr / (last_atr_ema + 1e-9)) if not np.isnan(last_atr_ema) else 1.0
     if atr_spike >= 1.15:
         gates += 1
 
-    # Gate 6: HTF trend confirmation (strict)
+    # 6) HTF trend
     if direction == "LONG" and last_htf_close >= last_htf_sma * 1.001:
         gates += 1
     if direction == "SHORT" and last_htf_close <= last_htf_sma * 0.999:
         gates += 1
 
-    # Gate 7: HTF ADX (strict)
+    # 7) HTF ADX
     if last_htf_adx >= 23:
         gates += 1
 
-    # Gate 8: ENTRY QUALITY (SERT - geç giriş yok)
-    # - Last 3 candles pump/dump must be limited
-    # - Not too stretched from SMA20
-    # - Avoid extreme RSI
-    if len(c) >= 5:
-        ch3 = pct_change(float(c[-4]), float(c[-1]))
-    else:
-        ch3 = 0.0
-
+    # 8) Entry quality (avoid late entries)
+    ch3 = pct_change(float(c[-4]), float(c[-1])) if len(c) >= 5 else 0.0
     stretch_ok = abs(sma_dist_pct) <= 1.50
 
     if direction == "LONG":
@@ -467,7 +420,6 @@ def score_symbol_8gates(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
         if entry_ok:
             gates += 1
     else:
-        # For short: avoid extreme oversold and avoid "late dump"
         entry_ok = (last_rsi >= 30) and stretch_ok and (ch3 >= -3.0)
         if entry_ok:
             gates += 1
@@ -475,21 +427,10 @@ def score_symbol_8gates(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
     raw = (gates / 8.0) * 100.0
     score = step_score(raw, SCORE_STEP)
 
-    # SHORT display mapping: low score = better short (your style)
     disp_score = score if direction == "LONG" else (100 - score)
     disp_raw = int(round(raw)) if direction == "LONG" else int(round(100 - raw))
 
-    return {
-        "direction": direction,
-        "gates": int(gates),
-        "raw": int(disp_raw),
-        "score": int(disp_score),
-        "sma_dist_pct": float(sma_dist_pct),
-        "atr_spike": float(atr_spike),
-        "rsi": float(last_rsi),
-        "adx": float(last_adx),
-        "htf_adx": float(last_htf_adx),
-    }
+    return {"direction": direction, "gates": int(gates), "raw": int(disp_raw), "score": int(disp_score)}
 
 
 def strong_flag(direction: str, gates: int, score: int) -> bool:
@@ -501,28 +442,27 @@ def strong_flag(direction: str, gates: int, score: int) -> bool:
 
 
 # =========================
-# UI TABLE STYLE (OLD LOOK: LONG green / SHORT red / STRONG darker)
+# UI TABLE STYLE (FIXED - NO MORE VALUEERROR)
 # =========================
 def style_table(df: pd.DataFrame):
+    # IMPORTANT FIX:
+    # row_style MUST return a list with length == number of columns in the row.
     def row_style(row):
         direction = str(row.get("YÖN", ""))
         strong = bool(row.get("STRONG", False))
         both = (str(row.get("SOURCE", "")) == "BOTH")
 
         if direction == "LONG":
-            bg = "#1f6f55" if not strong else "#0f4b37"   # green / darker green
+            bg = "#1f6f55" if not strong else "#0f4b37"
         else:
-            bg = "#5b1b1b" if not strong else "#3b0f0f"   # red / darker red
+            bg = "#5b1b1b" if not strong else "#3b0f0f"
 
-        # BOTH + STRONG slightly more emphasis via border/glow-ish (still simple)
         border = "rgba(255,255,255,0.10)" if (both and strong) else "rgba(255,255,255,0.06)"
-        return [
-            f"background-color: {bg}",
-            "color: #e9f1ef",
-            f"border-color: {border}",
-        ]
+        base = f"background-color: {bg}; color: #e9f1ef; border-color: {border};"
 
-    styler = df.style.apply(lambda r: row_style(r), axis=1)
+        return [base] * len(row)
+
+    styler = df.style.apply(row_style, axis=1)
     styler = styler.set_table_styles(
         [
             {"selector": "th", "props": [("background-color", "#121826"), ("color", "#dbe7ff"), ("border-color", "rgba(255,255,255,0.12)")]},
@@ -534,7 +474,7 @@ def style_table(df: pd.DataFrame):
 
 
 # =========================
-# TELEGRAM MESSAGE (SINGLE LIST, LIKE YOUR SCREENSHOTS)
+# TELEGRAM (SINGLE LIST)
 # =========================
 def _tg_line(coin: str, score: int, direction: str, src: str, align: bool) -> str:
     bullet = "🟩" if direction == "LONG" else "🟥"
@@ -591,7 +531,7 @@ def tg_send_report(df_list: pd.DataFrame, title: str):
 # =========================
 st.title("🎯 Sniper — Auto (LONG + SHORT)")
 st.caption(
-    f"TF={TF} • HTF={HTF} • FULL SERT: STRONG = {GATES_REQUIRED_STRONG}/{GATES_REQUIRED_STRONG} • "
+    f"TF={TF} • HTF={HTF} • FULL SERT: STRONG={GATES_REQUIRED_STRONG}/{GATES_REQUIRED_STRONG} • "
     f"Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s"
 )
 
@@ -604,7 +544,6 @@ if "last_report_ts" not in st.session_state:
 
 kucoin, okx = get_exchanges()
 
-# Connection cards
 colA, colB, colC = st.columns([1, 1, 1])
 with colA:
     ku_ok = load_markets_safe(kucoin, "KuCoin")
@@ -621,15 +560,11 @@ with colC:
 if not (ku_ok and ok_ok):
     st.stop()
 
-# BTC regime (info only, professional overlay)
 reg = btc_regime(okx, kucoin)
-reg_state = reg["state"]
-reg_src = reg["src"]
 st.markdown(
-    f"**İstanbul Time:** `{now_istanbul_str()}`  •  **BTC Regime (1H):** `{reg_state}`  •  Source: `{reg_src}`"
+    f"**İstanbul Time:** `{now_istanbul_str()}`  •  **BTC Regime (1H):** `{reg['state']}`  •  Source: `{reg['src']}`"
 )
 
-# Load symbols
 with st.spinner("Marketler taranıyor (hacim/spread filtreleri uygulanıyor)..."):
     ku_syms = fetch_top_usdt_symbols(kucoin, TOP_N_PER_EXCHANGE)
     ok_syms = fetch_top_usdt_symbols(okx, TOP_N_PER_EXCHANGE)
@@ -638,7 +573,6 @@ ku_set = set(ku_syms)
 ok_set = set(ok_syms)
 scan_list = sorted(list(ku_set.union(ok_set)))
 
-# Scan
 progress = st.progress(0, text=f"Taranıyor: 0/{len(scan_list)}")
 
 rows = []
@@ -648,7 +582,6 @@ for i, sym in enumerate(scan_list, start=1):
     progress.progress(i / max(1, len(scan_list)), text=f"Taranıyor: {i}/{len(scan_list)} • {sym}")
 
     base = sym.split("/")[0]
-
     res_ku = None
     res_ok = None
 
@@ -676,13 +609,12 @@ for i, sym in enumerate(scan_list, start=1):
             chosen = {"direction": direction, "gates": gates, "score": score, "raw": raw}
             source = "BOTH"
         else:
-            # Divergence: pick higher gates then better "strength"
+            # divergence: pick higher gates; if tie pick better rank
             a = res_ku
             b = res_ok
             if a["gates"] != b["gates"]:
                 pick = a if a["gates"] > b["gates"] else b
             else:
-                # compare strength rank (LONG: higher score better, SHORT: lower better)
                 a_rank = (a["score"] if a["direction"] == "LONG" else (100 - a["score"]))
                 b_rank = (b["score"] if b["direction"] == "LONG" else (100 - b["score"]))
                 pick = a if a_rank >= b_rank else b
@@ -697,7 +629,6 @@ for i, sym in enumerate(scan_list, start=1):
     else:
         continue
 
-    # Price + qv best-effort
     last_price = 0.0
     qv = 0.0
     try:
@@ -718,14 +649,14 @@ for i, sym in enumerate(scan_list, start=1):
     raw = int(chosen["raw"])
     strong = strong_flag(direction, gates, score)
 
-    # BTC regime alignment (does NOT block, B mode)
-    align = False
-    if reg_state == "BULL" and direction == "LONG":
+    # B mode: no blocking, only align label
+    align = True
+    if reg["state"] == "BULL":
+        align = (direction == "LONG")
+    elif reg["state"] == "BEAR":
+        align = (direction == "SHORT")
+    elif reg["state"] == "NEUTRAL":
         align = True
-    if reg_state == "BEAR" and direction == "SHORT":
-        align = True
-    if reg_state == "NEUTRAL":
-        align = True  # neutral = allow both
 
     row = {
         "YÖN": direction,
@@ -741,7 +672,6 @@ for i, sym in enumerate(scan_list, start=1):
     }
     rows.append(row)
 
-    # strong rows for telegram trigger (only BOTH strong)
     if strong and source == "BOTH":
         strong_rows.append(row)
 
@@ -752,7 +682,6 @@ if df_all.empty:
     st.warning("Hiç aday çıkmadı. Filtreler çok sert olabilir (hacim/spread).")
     st.stop()
 
-# Sort priority: BOTH -> STRONG -> ALIGN -> KAPI -> SCORE_RANK -> QV
 df_all["_prio_both"] = (df_all["SOURCE"] == "BOTH").astype(int)
 df_all["_prio_strong"] = (df_all["STRONG"] == True).astype(int)
 df_all["_prio_align"] = (df_all["ALIGN"] == True).astype(int)
@@ -763,24 +692,14 @@ df_all = df_all.sort_values(
     ascending=[False, False, False, False, False, False],
 ).drop(columns=["_prio_both", "_prio_strong", "_prio_align", "_score_rank"])
 
-# Counters
 strong_long = int(((df_all["STRONG"]) & (df_all["YÖN"] == "LONG") & (df_all["SOURCE"] == "BOTH")).sum())
 strong_short = int(((df_all["STRONG"]) & (df_all["YÖN"] == "SHORT") & (df_all["SOURCE"] == "BOTH")).sum())
 cnt_long = int((df_all["YÖN"] == "LONG").sum())
 cnt_short = int((df_all["YÖN"] == "SHORT").sum())
 
-aligned_strong_long = int(((df_all["STRONG"]) & (df_all["YÖN"] == "LONG") & (df_all["SOURCE"] == "BOTH") & (df_all["ALIGN"] == True)).sum())
-aligned_strong_short = int(((df_all["STRONG"]) & (df_all["YÖN"] == "SHORT") & (df_all["SOURCE"] == "BOTH") & (df_all["ALIGN"] == True)).sum())
-
-# UI header stats
 st.success("Tarama bitti ✅")
-st.info(
-    f"✅ STRONG LONG(BOTH): {strong_long} | 💀 STRONG SHORT(BOTH): {strong_short} | "
-    f"LONG: {cnt_long} | SHORT: {cnt_short}  •  "
-    f"🎯 Aligned STRONG (BTC Regime): LONG {aligned_strong_long} / SHORT {aligned_strong_short}"
-)
+st.info(f"✅ STRONG LONG(BOTH): {strong_long} | 💀 STRONG SHORT(BOTH): {strong_short} | LONG: {cnt_long} | SHORT: {cnt_short}")
 
-# Always show 20 rows (10 long + 10 short) filled by top ranking
 df_long = df_all[df_all["YÖN"] == "LONG"].head(TABLE_N_LONG)
 df_short = df_all[df_all["YÖN"] == "SHORT"].head(TABLE_N_SHORT)
 df_show = pd.concat([df_long, df_short], ignore_index=True)
@@ -790,22 +709,22 @@ if (strong_long + strong_short) == 0:
 else:
     st.success("✅ STRONG bulundu. Kalan boşluklar TOP adaylarla dolduruldu.")
 
+# UI tablo: eski yapı bozulmasın diye ALIGN göstermiyoruz
+df_show_ui = df_show.drop(columns=["ALIGN"], errors="ignore")
+
 st.subheader("🎯 SNIPER TABLO")
-st.dataframe(style_table(df_show), use_container_width=True, hide_index=True)
+st.dataframe(style_table(df_show_ui), use_container_width=True, hide_index=True)
 
 
 # =========================
-# TELEGRAM LOGIC (SINGLE LIST)
-# - If NEW STRONG (BOTH) appears -> send single list (best strongs)
-# - Else every 20 min -> send report (best 20)
+# TELEGRAM LOGIC (single message)
 # =========================
 if tg_enabled():
     df_strongs = pd.DataFrame(strong_rows) if strong_rows else pd.DataFrame(columns=df_all.columns)
-
     new_keys = []
+
     if not df_strongs.empty:
         best_strongs = pick_best_for_telegram(df_all, only_strong_both=True)
-
         if not best_strongs.empty:
             for _, r in best_strongs.iterrows():
                 k = f"{r['COIN']}|{r['YÖN']}|{r['SOURCE']}|{int(r['SKOR'])}|{int(r['KAPI'])}"
@@ -816,7 +735,6 @@ if tg_enabled():
             if new_keys:
                 tg_send_report(best_strongs, "STRONG SİNYAL (8/8) — BOTH")
 
-    # No new strong -> periodic report
     if not new_keys:
         now_ts = time.time()
         if (now_ts - st.session_state.last_report_ts) >= (REPORT_EVERY_MIN * 60):
