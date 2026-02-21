@@ -4,3 +4,6 @@ numpy==2.1.3
 ccxt==4.4.97
 requests
 streamlit-autorefresh
+import requests
+from streamlit_autorefresh import st_autorefresh
+
