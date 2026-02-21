@@ -1,13 +1,11 @@
 import time
 from datetime import datetime, timezone
-import math
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-
 import ccxt
 
 
@@ -22,7 +20,7 @@ HTF = "1h"
 TOP_N_PER_EXCHANGE = 150          # her borsadan en yüksek hacimli ilk N (filtre sonrası)
 TABLE_N_LONG = 10                # tabloda LONG kaç satır
 TABLE_N_SHORT = 10               # tabloda SHORT kaç satır
-AUTO_REFRESH_SEC = 240           # Streamlit sayfa yenileme (test için)
+AUTO_REFRESH_SEC = 240           # Streamlit sayfa yenileme
 REPORT_EVERY_MIN = 20            # STRONG yoksa rapor kaç dakikada bir Telegram
 
 # STRONG kriterleri
@@ -34,11 +32,12 @@ GATES_REQUIRED_STRONG = 6
 SCORE_STEP = 5
 
 # Likidite filtresi (çöp azaltma)
-MIN_QV_24H_USDT = 250_000        # çok düşük hacimlileri ele
-MAX_SPREAD_PCT = 0.35            # %0.35 üstü spread -> ele (spot için iyi pratik)
+MIN_QV_24H_USDT = 250_000
+MAX_SPREAD_PCT = 0.35
 
 # ccxt rate limit
 CCXT_RATE_LIMIT = True
+
 
 # =========================
 # TELEGRAM (SECRETS)
@@ -55,7 +54,7 @@ TG_CHAT_ID = _get_secret("TG_CHAT_ID")
 def tg_enabled() -> bool:
     return bool(TG_TOKEN) and bool(TG_CHAT_ID)
 
-def send_telegram_html(html_text: str):
+def send_telegram_html(html_text: str) -> bool:
     if not tg_enabled():
         return False
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -113,10 +112,8 @@ def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
     return s.ewm(alpha=1/period, adjust=False).mean().to_numpy()
 
 def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
-    # Wilder-style ADX
     h = pd.Series(high)
     l = pd.Series(low)
-    c = pd.Series(close)
 
     up_move = h.diff()
     down_move = -l.diff()
@@ -139,7 +136,6 @@ def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
 # HELPERS
 # =========================
 def now_istanbul_str():
-    # Istanbul is UTC+3 constant (no DST)
     ts = datetime.now(timezone.utc).timestamp() + 3 * 3600
     dt = datetime.fromtimestamp(ts)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -158,7 +154,6 @@ def safe_float(x, default=0.0):
         return default
 
 def symbol_clean(sym: str) -> str:
-    # OKX bazen "BTC/USDT" yerine "BTC/USDT:USDT" döndürebilir. Biz spot istiyoruz.
     return sym.replace(":USDT", "")
 
 def is_usdt_spot_symbol(sym: str) -> bool:
@@ -167,7 +162,6 @@ def is_usdt_spot_symbol(sym: str) -> bool:
 
 def is_junk_symbol(base: str) -> bool:
     b = base.upper()
-    # stable, leverage tokens vs. (basit filtre)
     junk = {
         "USDT","USDC","BUSD","TUSD","DAI","FDUSD","USDP","EUR","EURT",
         "3S","3L","5S","5L","BULL","BEAR","UP","DOWN"
@@ -197,7 +191,6 @@ def get_exchanges():
     })
     return kucoin, okx
 
-
 def load_markets_safe(ex, name: str) -> bool:
     try:
         ex.load_markets()
@@ -206,8 +199,7 @@ def load_markets_safe(ex, name: str) -> bool:
         st.error(f"{name}: Market yüklenemedi: {e}")
         return False
 
-
-def fetch_top_usdt_symbols(ex, ex_name: str, top_n: int) -> list[str]:
+def fetch_top_usdt_symbols(ex, top_n: int) -> list[str]:
     try:
         tickers = ex.fetch_tickers()
     except Exception:
@@ -245,8 +237,7 @@ def fetch_top_usdt_symbols(ex, ex_name: str, top_n: int) -> list[str]:
     df = df.sort_values("qv24h", ascending=False).head(top_n)
     return df["symbol"].tolist()
 
-
-def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame | None:
+def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200):
     try:
         o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not o or len(o) < 60:
@@ -260,7 +251,7 @@ def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200) -> pd.Data
 # =========================
 # SCORING (6 gates)
 # =========================
-def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
+def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame):
     h = df["high"].to_numpy(dtype=float)
     l = df["low"].to_numpy(dtype=float)
     c = df["close"].to_numpy(dtype=float)
@@ -279,17 +270,19 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
     last = c[-1]
 
     direction = "LONG" if (last >= s20[-1] and r[-1] >= 50) else "SHORT"
-
     gates = 0
 
+    # Gate 1 RSI bias
     if direction == "LONG" and r[-1] >= 55:
         gates += 1
     if direction == "SHORT" and r[-1] <= 45:
         gates += 1
 
+    # Gate 2 ADX
     if a[-1] >= 18:
         gates += 1
 
+    # Gate 3 BB position
     if direction == "LONG":
         if last <= mid[-1] or last >= mid[-1] * 1.002:
             gates += 1
@@ -297,17 +290,20 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
         if last >= mid[-1] or last <= mid[-1] * 0.998:
             gates += 1
 
+    # Gate 4 SMA20 distance
     sma_dist_pct = (last - s20[-1]) / s20[-1] * 100 if s20[-1] else 0.0
     if direction == "LONG" and sma_dist_pct >= 0.10:
         gates += 1
     if direction == "SHORT" and sma_dist_pct <= -0.10:
         gates += 1
 
+    # Gate 5 ATR spike
     atr_ema = ema(at, 20)
     atr_spike = (at[-1] / atr_ema[-1]) if atr_ema[-1] and not np.isnan(atr_ema[-1]) else 1.0
     if atr_spike >= 1.05:
         gates += 1
 
+    # Gate 6 HTF confirm
     htf_sma20 = sma(htf_c, 20)
     if not np.isnan(htf_sma20[-1]):
         if direction == "LONG" and htf_c[-1] >= htf_sma20[-1]:
@@ -318,16 +314,11 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
     raw = (gates / 6) * 100.0
     score = step_score(raw, SCORE_STEP)
 
+    # SHORT görünümü: düşük skor = daha bearish
     disp_score = score if direction == "LONG" else (100 - score)
     disp_raw = int(round(raw)) if direction == "LONG" else int(round(100 - raw))
 
-    return {
-        "direction": direction,
-        "gates": gates,
-        "raw": disp_raw,
-        "score": int(disp_score),
-    }
-
+    return {"direction": direction, "gates": gates, "score": int(disp_score), "raw": int(disp_raw)}
 
 def strong_flag(direction: str, gates: int, score: int) -> bool:
     if gates < GATES_REQUIRED_STRONG:
@@ -338,64 +329,68 @@ def strong_flag(direction: str, gates: int, score: int) -> bool:
 
 
 # =========================
-# TELEGRAM MESSAGE BUILDERS
+# TELEGRAM MESSAGE BUILDERS (GÖRSELDEKİ GİBİ)
 # =========================
-def format_signal_line(row: dict, include_source: bool = True) -> str:
+def format_signal_line(row: dict) -> str:
     coin = row["COIN"]
     score = int(row["SKOR"])
-    direction = row["YÖN"]
-    src = row["SOURCE"]
+    direction = str(row["YÖN"]).upper()
+    src = row.get("SOURCE", "")
 
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
-    if include_source:
-        return f"{coin}: <b>{score}</b> Puan | {dir_emoji} <b>{direction}</b> (<b>{src}</b>)"
-    return f"{coin}: <b>{score}</b> Puan | {dir_emoji} <b>{direction}</b>"
+    src_txt = f"  <i>({src})</i>" if src else ""
+    return f"<b>{coin}</b>: <b>{score}</b> Puan | {dir_emoji} <b>{direction}</b>{src_txt}"
 
 def tg_send_strong_alerts(strong_rows: list[dict]):
-    """
-    ✅ STRONG SİNYAL
-    COIN: 100 Puan | 🟢 LONG (BOTH)
-    ...
-    ⏱ İstanbul: ....
-    """
-    if not strong_rows:
-        return
-
-    # LONG üstte, SHORT altta; skor büyükten küçüğe
-    def sort_key(r):
-        yon = (r.get("YÖN") or "").upper()
-        is_long = 1 if "LONG" in yon else 0
-        return (-is_long, -int(r.get("SKOR", 0)))
-
-    strong_rows = sorted(strong_rows, key=sort_key)
-
-    lines = []
-    lines.append("✅ <b>STRONG SİNYAL</b>")
     for r in strong_rows:
-        lines.append(format_signal_line(r, include_source=True))
-    lines.append("")
-    lines.append(f"⏱ İstanbul: <code>{now_istanbul_str()}</code>")
-
-    send_telegram_html("\n".join(lines))
+        msg = (
+            "✅ <b>STRONG SİNYAL</b>\n"
+            f"{format_signal_line(r)}\n\n"
+            f"⏱ İstanbul: <code>{now_istanbul_str()}</code>"
+        )
+        send_telegram_html(msg)
 
 def tg_send_report(long_rows: list[dict], short_rows: list[dict]):
-    """
-    📋 Gözcü Raporu (L/S)
-    COIN: 80 Puan | 🟢 LONG
-    COIN: 50 Puan | 🔴 SHORT
-    ⏱ İstanbul: ....
-    """
     lines = []
     lines.append("📋 <b>Gözcü Raporu (L/S)</b>")
-    lines.append("")
+    lines.append("")  # boş satır
+
     for r in long_rows:
-        lines.append(format_signal_line(r, include_source=False))
+        lines.append("🟩 " + format_signal_line(r))
+
     for r in short_rows:
-        lines.append(format_signal_line(r, include_source=False))
+        lines.append("🟥 " + format_signal_line(r))
+
     lines.append("")
     lines.append(f"⏱ İstanbul: <code>{now_istanbul_str()}</code>")
-
     send_telegram_html("\n".join(lines))
+
+
+# =========================
+# TABLE STYLING (renkler geri geldi)
+# =========================
+def style_rows(df: pd.DataFrame):
+    def _row_style(row):
+        direction = str(row.get("YÖN", "")).upper()
+        strong = bool(row.get("STRONG", False))
+
+        # LONG yeşil, SHORT kırmızı. STRONG daha koyu.
+        if direction == "LONG":
+            bg = "rgba(0, 120, 70, 0.55)" if strong else "rgba(0, 120, 70, 0.28)"
+        else:
+            bg = "rgba(160, 20, 20, 0.55)" if strong else "rgba(160, 20, 20, 0.28)"
+
+        return [f"background-color: {bg};"] * len(row)
+
+    sty = df.style.apply(_row_style, axis=1)
+
+    # sayı formatları (göz yormasın)
+    if "FİYAT" in df.columns:
+        sty = sty.format({"FİYAT": "{:,.8f}"})
+    if "QV_24H" in df.columns:
+        sty = sty.format({"QV_24H": "{:,.0f}"})
+
+    return sty
 
 
 # =========================
@@ -407,16 +402,15 @@ st.caption(
     f"{GATES_REQUIRED_STRONG} Kapı • Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s"
 )
 
-# Auto refresh (Streamlit test)
 st_autorefresh(interval=AUTO_REFRESH_SEC * 1000, key="auto_refresh")
 
-# Session state
 if "sent_keys" not in st.session_state:
     st.session_state.sent_keys = set()
 if "last_report_ts" not in st.session_state:
     st.session_state.last_report_ts = 0.0
+if "boot_sent" not in st.session_state:
+    st.session_state.boot_sent = False
 
-# Connection blocks
 kucoin, okx = get_exchanges()
 
 colA, colB = st.columns(2)
@@ -427,7 +421,6 @@ with colB:
     ok_ok = load_markets_safe(okx, "OKX")
     st.success("OKX: ✅ Bağlandı" if ok_ok else "OKX: ❌ Hata")
 
-# Telegram status
 if tg_enabled():
     st.info("Telegram: ✅ Secrets bulundu (TG_TOKEN + TG_CHAT_ID).")
 else:
@@ -436,13 +429,17 @@ else:
 if not (ku_ok and ok_ok):
     st.stop()
 
+# (Opsiyonel) ilk açılışta 1 kere mod mesajı
+if tg_enabled() and (not st.session_state.boot_sent):
+    st.session_state.boot_sent = True
+    send_telegram_html("✅ <b>Sniper Çift Yönlü Modda Başladı!</b>\n🟢 Long ve 🔴 Short takibi aktif.")
+
 with st.spinner("Marketler taranıyor (hacim/spread filtreleri uygulanıyor)..."):
-    ku_syms = fetch_top_usdt_symbols(kucoin, "KuCoin", TOP_N_PER_EXCHANGE)
-    ok_syms = fetch_top_usdt_symbols(okx, "OKX", TOP_N_PER_EXCHANGE)
+    ku_syms = fetch_top_usdt_symbols(kucoin, TOP_N_PER_EXCHANGE)
+    ok_syms = fetch_top_usdt_symbols(okx, TOP_N_PER_EXCHANGE)
 
 ku_set = set(ku_syms)
 ok_set = set(ok_syms)
-
 scan_list = sorted(list(ku_set.union(ok_set)))
 
 progress = st.progress(0, text=f"Taranıyor: 0/{len(scan_list)}")
@@ -482,9 +479,7 @@ for i, sym in enumerate(scan_list, start=1):
             chosen = {"direction": direction, "gates": gates, "score": score, "raw": raw}
             source = "BOTH"
         else:
-            a = res_ku
-            b = res_ok
-            pick = a if a["gates"] > b["gates"] else b
+            pick = res_ku if res_ku["gates"] > res_ok["gates"] else res_ok
             chosen = pick
             source = "BOTH"
     elif res_ku:
@@ -520,7 +515,7 @@ for i, sym in enumerate(scan_list, start=1):
         "YÖN": direction,
         "COIN": base,
         "SKOR": score,
-        "FİYAT": last_price,
+        "FİYAT": float(last_price) if last_price else 0.0,
         "RAW": raw,
         "QV_24H": int(qv) if qv else 0,
         "KAPI": gates,
@@ -529,6 +524,7 @@ for i, sym in enumerate(scan_list, start=1):
     }
     rows.append(row)
 
+    # STRONG telegram only for BOTH
     if strong and source == "BOTH":
         strong_rows.append(row)
 
@@ -539,6 +535,7 @@ if df_all.empty:
     st.warning("Hiç aday çıkmadı. Filtreler çok sert olabilir (hacim/spread).")
     st.stop()
 
+# Sort priority: BOTH -> STRONG -> LONG -> gates -> score -> qv
 df_all["_prio_source"] = (df_all["SOURCE"] == "BOTH").astype(int)
 df_all["_prio_strong"] = df_all["STRONG"].astype(int)
 df_all["_prio_dir"] = (df_all["YÖN"] == "LONG").astype(int)
@@ -567,8 +564,13 @@ else:
     st.success("✅ STRONG bulundu. Kalan boşluklar TOP adaylarla dolduruldu.")
 
 st.subheader("🎯 SNIPER TABLO")
+
+# tablo sırası sabit
+cols_order = ["YÖN","COIN","SKOR","FİYAT","RAW","QV_24H","KAPI","STRONG","SOURCE"]
+df_show = df_show[cols_order]
+
 st.dataframe(
-    df_show,
+    style_rows(df_show),
     use_container_width=True,
     hide_index=True
 )
@@ -576,6 +578,7 @@ st.dataframe(
 # =========================
 # TELEGRAM LOGIC
 # =========================
+# 1) STRONG (BOTH) -> instantly message (only NEW ones)
 new_strongs = []
 for r in strong_rows:
     key = f"{r['COIN']}|{r['YÖN']}|{r['SOURCE']}|{r['SKOR']}|{r['KAPI']}"
@@ -585,22 +588,21 @@ for r in strong_rows:
 
 if tg_enabled():
     if new_strongs:
-        # ✅ now sends ONE message, list format
         tg_send_strong_alerts(new_strongs)
     else:
         now_ts = time.time()
         if (now_ts - st.session_state.last_report_ts) >= (REPORT_EVERY_MIN * 60):
-            rep_long = df_long.to_dict("records")
-            rep_short = df_short.to_dict("records")
+            rep_long = df_long[cols_order].to_dict("records")
+            rep_short = df_short[cols_order].to_dict("records")
             tg_send_report(rep_long, rep_short)
             st.session_state.last_report_ts = now_ts
 
-with st.expander("🧪 Telegram Test (İstersen)"):
+with st.expander("🧪 Telegram Test"):
     if tg_enabled():
         if st.button("Test Mesajı Gönder"):
             ok = send_telegram_html(
                 "✅ <b>Sniper Gözcü</b> Telegram testi çalışıyor.\n"
-                "⏱ İstanbul: <code>" + now_istanbul_str() + "</code>"
+                f"⏱ İstanbul: <code>{now_istanbul_str()}</code>"
             )
             st.success("Gönderildi ✅" if ok else "Gönderilemedi ❌")
     else:
