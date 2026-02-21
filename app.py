@@ -10,7 +10,7 @@ import ccxt
 
 
 # =========================
-# CONFIG
+# CONFIG (ORİJİNAL AKIŞ KORUNDU)
 # =========================
 st.set_page_config(page_title="Sniper — Auto (LONG + SHORT)", layout="wide")
 
@@ -23,24 +23,22 @@ TABLE_N_SHORT = 10                # UI tabloda SHORT kaç satır
 AUTO_REFRESH_SEC = 240            # Streamlit sayfa yenileme
 REPORT_EVERY_MIN = 20             # STRONG yoksa rapor kaç dakikada bir Telegram
 
-# ===== 7 KAPI (FINAL) =====
-# STRONG = 7/7 kapı
-GATES_REQUIRED_STRONG = 7
-
-# “Nadir ama bomba” için daha seçici skor/kapı
-# (Skor adımı: 2 puan, 96+ gibi)
-SCORE_STEP = 2
-STRONG_LONG_SCORE_MIN = 96        # 96/98/100
-STRONG_SHORT_SCORE_MAX = 4        # 0/2/4
-
-# Likidite filtresi (çöp azaltma)
-MIN_QV_24H_USDT = 300_000
-MAX_SPREAD_PCT = 0.35
-
-CCXT_RATE_LIMIT = True
-
+# Telegram mesajı maksimum kaç coin listeleyecek
 TG_MAX_LIST = 20
 
+# Skor adımı (daha sıkı)
+SCORE_STEP = 2
+
+# Likidite filtresi (çöp azaltma)
+MIN_QV_24H_USDT = 500_000         # daha seçici (STRONG sayısını düşürür)
+MAX_SPREAD_PCT = 0.25             # daha seçici (spread yüksekleri ele)
+
+# ccxt rate limit
+CCXT_RATE_LIMIT = True
+
+# STRONG kriterleri (7/7)
+GATES_TOTAL = 7
+GATES_REQUIRED_STRONG = 7
 
 # =========================
 # TELEGRAM (SECRETS)
@@ -75,7 +73,7 @@ def send_telegram_html(html_text: str) -> bool:
 
 
 # =========================
-# INDICATORS (no pandas_ta)
+# INDICATORS (NO pandas_ta)
 # =========================
 def sma(series: np.ndarray, period: int) -> np.ndarray:
     s = pd.Series(series)
@@ -115,6 +113,7 @@ def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
     return s.ewm(alpha=1/period, adjust=False).mean().to_numpy()
 
 def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    # Wilder-style ADX
     h = pd.Series(high)
     l = pd.Series(low)
 
@@ -139,6 +138,7 @@ def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
 # HELPERS
 # =========================
 def now_istanbul_str():
+    # Istanbul is UTC+3 constant (no DST)
     ts = datetime.now(timezone.utc).timestamp() + 3 * 3600
     dt = datetime.fromtimestamp(ts)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -241,7 +241,7 @@ def fetch_top_usdt_symbols(ex, top_n: int) -> list[str]:
     df = df.sort_values("qv24h", ascending=False).head(top_n)
     return df["symbol"].tolist()
 
-def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame | None:
+def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200):
     try:
         o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not o or len(o) < 120:
@@ -253,90 +253,91 @@ def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200) -> pd.Data
 
 
 # =========================
-# SCORING (7 gates)
+# 7 KAPI SİSTEMİ (SERT + PATLAYICI)
 # =========================
-def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
+def score_symbol_7gates(df: pd.DataFrame, df_htf: pd.DataFrame):
     """
-    7 Kapı:
-      1) RSI Bias: LONG>=58 / SHORT<=42
-      2) ADX (TF) >= 22
-      3) ATR Spike >= 1.08
-      4) SMA20 Momentum Mesafesi (LONG >= +0.20% / SHORT <= -0.20%)
-      5) HTF Trend: 1H close vs 1H SMA20 (aynı yönde)
-      6) BB / trend filtresi (var olanı koruyoruz): LONG mid üstü / SHORT mid altı
-      7) HTF ADX >= 20
+    7 Gates:
+    1) RSI Bias: LONG >= 58 (sert: 60), SHORT <= 42 (sert: 40)
+    2) ADX (TF) >= 22 (sert: 25)
+    3) ATR Spike >= 1.08 (sert: 1.10)
+    4) SMA20 Momentum Mesafesi
+    5) HTF Trend: 1H close vs SMA20 (aynı yön)
+    6) BB / trend filtresi (mevcut mantık, daha sert)
+    7) HTF ADX >= 20 (sert: 23)
     """
     h = df["high"].to_numpy(dtype=float)
     l = df["low"].to_numpy(dtype=float)
     c = df["close"].to_numpy(dtype=float)
 
     hh = df_htf["high"].to_numpy(dtype=float)
-    hl = df_htf["low"].to_numpy(dtype=float)
-    hc = df_htf["close"].to_numpy(dtype=float)
+    ll = df_htf["low"].to_numpy(dtype=float)
+    cc = df_htf["close"].to_numpy(dtype=float)
 
     r = rsi(c, 14)
-    adx_tf = adx(h, l, c, 14)
+    a = adx(h, l, c, 14)
     mid, up, lowb = bollinger(c, 20, 2.0)
     s20 = sma(c, 20)
     at = atr(h, l, c, 14)
 
-    htf_sma20 = sma(hc, 20)
-    htf_adx = adx(hh, hl, hc, 14)
+    htf_s20 = sma(cc, 20)
+    htf_adx = adx(hh, ll, cc, 14)
 
-    # NaN guard
-    needed = [r[-1], adx_tf[-1], mid[-1], s20[-1], at[-1], htf_sma20[-1], htf_adx[-1]]
-    if any((x is None) or (isinstance(x, float) and np.isnan(x)) for x in needed):
+    if any(np.isnan(x[-1]) for x in [r, a, mid, up, lowb, s20, at, htf_s20, htf_adx]):
         return None
 
-    last = c[-1]
+    last = float(c[-1])
 
-    # Direction heuristic (aynı kalır)
+    # Direction heuristic (orijinal gibi)
     direction = "LONG" if (last >= s20[-1] and r[-1] >= 50) else "SHORT"
 
     gates = 0
 
-    # 1) RSI Bias
-    if direction == "LONG" and r[-1] >= 58:
+    # 1) RSI Bias (sert)
+    if direction == "LONG" and r[-1] >= 60:
         gates += 1
-    if direction == "SHORT" and r[-1] <= 42:
-        gates += 1
-
-    # 2) ADX (TF)
-    if adx_tf[-1] >= 22:
+    if direction == "SHORT" and r[-1] <= 40:
         gates += 1
 
-    # 3) ATR Spike
+    # 2) ADX (TF) (sert)
+    if a[-1] >= 25:
+        gates += 1
+
+    # 3) ATR Spike (sert)
     atr_ema = ema(at, 20)
     atr_spike = (at[-1] / atr_ema[-1]) if atr_ema[-1] and not np.isnan(atr_ema[-1]) else 1.0
-    if atr_spike >= 1.08:
+    if atr_spike >= 1.10:
         gates += 1
 
-    # 4) SMA20 Momentum Mesafesi
+    # 4) SMA20 Momentum Mesafesi (sert)
     sma_dist_pct = (last - s20[-1]) / s20[-1] * 100 if s20[-1] else 0.0
-    if direction == "LONG" and sma_dist_pct >= 0.20:
+    if direction == "LONG" and sma_dist_pct >= 0.30:
         gates += 1
-    if direction == "SHORT" and sma_dist_pct <= -0.20:
-        gates += 1
-
-    # 5) HTF Trend (1H close vs 1H SMA20)
-    if direction == "LONG" and hc[-1] >= htf_sma20[-1]:
-        gates += 1
-    if direction == "SHORT" and hc[-1] <= htf_sma20[-1]:
+    if direction == "SHORT" and sma_dist_pct <= -0.30:
         gates += 1
 
-    # 6) BB / trend filtresi (var olan)
+    # 5) HTF Trend (1H close vs SMA20)
+    if direction == "LONG" and cc[-1] >= htf_s20[-1] * 1.001:
+        gates += 1
+    if direction == "SHORT" and cc[-1] <= htf_s20[-1] * 0.999:
+        gates += 1
+
+    # 6) BB / trend filtresi (sert)
+    # LONG: mid üstü + tercihen upper'a yaklaşma
+    # SHORT: mid altı + tercihen lower'a yaklaşma
     if direction == "LONG":
-        if last >= mid[-1] * 1.001:
+        if last >= mid[-1] * 1.002:
             gates += 1
     else:
-        if last <= mid[-1] * 0.999:
+        if last <= mid[-1] * 0.998:
             gates += 1
 
-    # 7) HTF ADX >= 20
-    if htf_adx[-1] >= 20:
+    # 7) HTF ADX >= 20 (sert)
+    if htf_adx[-1] >= 23:
         gates += 1
 
-    raw = (gates / 7) * 100.0
+    # raw score
+    raw = (gates / GATES_TOTAL) * 100.0
     score = step_score(raw, SCORE_STEP)
 
     # SHORT display mapping: düşük skor = daha iyi short (eski mantık)
@@ -348,68 +349,85 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame) -> dict | None:
         "gates": int(gates),
         "raw": int(disp_raw),
         "score": int(disp_score),
+        "atr_spike": float(atr_spike),
+        "rsi": float(r[-1]),
+        "adx": float(a[-1]),
+        "htf_adx": float(htf_adx[-1]),
+        "sma_dist_pct": float(sma_dist_pct),
     }
 
-def strong_flag(direction: str, gates: int, score: int) -> bool:
-    if gates < GATES_REQUIRED_STRONG:
-        return False
-    if direction == "LONG":
-        return score >= STRONG_LONG_SCORE_MIN
-    return score <= STRONG_SHORT_SCORE_MAX
+def strong_flag(direction: str, gates: int) -> bool:
+    # STRONG = 7/7
+    return gates >= GATES_REQUIRED_STRONG
 
 
 # =========================
-# UI TABLE STYLE (RENKLER)
+# UI TABLE STYLE (KOYU STRONG)
 # =========================
-def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+def style_table(df):
     def row_style(row):
         direction = str(row.get("YÖN", ""))
         strong = bool(row.get("STRONG", False))
 
         if direction == "LONG":
-            bg = "#1f6f55" if not strong else "#0f4b37"   # green / darker green (STRONG)
+            bg = "#1f6f55" if not strong else "#0f4b37"   # açık yeşil / koyu yeşil
         else:
-            bg = "#5b1b1b" if not strong else "#3b0f0f"   # red / darker red (STRONG)
+            bg = "#5b1b1b" if not strong else "#3b0f0f"   # açık kırmızı / koyu kırmızı
 
         return [
-            f"background-color: {bg}",
-            "color: #e9f1ef",
-            "border-color: rgba(255,255,255,0.08)",
+            f"background-color: {bg}; color: #e9f1ef;",
+            "border-color: rgba(255,255,255,0.08);"
         ]
 
-    styler = df.style.apply(lambda r: row_style(r), axis=1)
-    styler = styler.set_table_styles(
+    styled = df.style.apply(row_style, axis=1)
+
+    styled = styled.set_table_styles(
         [
-            {"selector": "th", "props": [("background-color", "#121826"), ("color", "#dbe7ff"), ("border-color", "rgba(255,255,255,0.10)")]},
+            {
+                "selector": "th",
+                "props": [
+                    ("background-color", "#121826"),
+                    ("color", "#dbe7ff"),
+                    ("border-color", "rgba(255,255,255,0.10)")
+                ],
+            },
             {"selector": "td", "props": [("border-color", "rgba(255,255,255,0.08)")]},
         ]
     )
-    styler = styler.format({
-        "FİYAT": "{:,.6f}",
-        "QV_24H": "{:,.0f}",
-    }, na_rep="-")
-    return styler
+
+    styled = styled.format(
+        {
+            "FİYAT": "{:,.6f}",
+            "QV_24H": "{:,.0f}",
+            "SMA%": "{:,.2f}",
+            "ATRx": "{:,.2f}",
+        },
+        na_rep="-",
+    )
+    return styled
 
 
 # =========================
-# TELEGRAM BUILDERS (TEK MESAJ, MAX 20)
+# TELEGRAM MESSAGE (TEK MESAJ LİSTE)
 # =========================
 def _tg_line(coin: str, score: int, direction: str, src: str, is_long_block: bool) -> str:
     bullet = "🟩" if is_long_block else "🟥"
     dir_emoji = "🟢" if direction == "LONG" else "🔴"
     return f"{bullet} {coin}: <b>{score}</b> Puan | {dir_emoji} <b>{direction}</b>  <i>({src})</i>"
 
-def _pick_top_for_telegram(df_all: pd.DataFrame, only_strong_both: bool) -> pd.DataFrame:
+def _pick_top20(df_all: pd.DataFrame, only_strong_both: bool) -> pd.DataFrame:
     df = df_all.copy()
+
     if only_strong_both:
         df = df[(df["STRONG"] == True) & (df["SOURCE"] == "BOTH")]
 
     if df.empty:
         return df
 
+    # SHORT için sıralama: düşük SKOR daha iyi, bu yüzden tersliyoruz
+    df["_score_rank"] = np.where(df["YÖN"] == "SHORT", 100 - df["SKOR"], df["SKOR"])
     df["_prio_both"] = (df["SOURCE"] == "BOTH").astype(int)
     df["_prio_strong"] = (df["STRONG"] == True).astype(int)
-    df["_score_rank"] = np.where(df["YÖN"] == "SHORT", 100 - df["SKOR"], df["SKOR"])
 
     df = df.sort_values(
         by=["_prio_both", "_prio_strong", "KAPI", "_score_rank", "QV_24H"],
@@ -418,9 +436,9 @@ def _pick_top_for_telegram(df_all: pd.DataFrame, only_strong_both: bool) -> pd.D
 
     return df.head(TG_MAX_LIST)
 
-def tg_send_report_list(df_list: pd.DataFrame):
+def tg_send_list(title: str, df_list: pd.DataFrame):
     lines = []
-    lines.append("📋 <b>Gözcü Raporu (L/S)</b>")
+    lines.append(f"{title}")
     lines.append(f"⏱ İstanbul: <code>{now_istanbul_str()}</code>")
     lines.append("")
 
@@ -441,13 +459,12 @@ def tg_send_report_list(df_list: pd.DataFrame):
 
 
 # =========================
-# MAIN UI
+# MAIN UI (ORİJİNAL AKIŞ)
 # =========================
 st.title("🎯 Sniper — Auto (LONG + SHORT)")
 st.caption(
-    f"TF={TF} • HTF={HTF} • STRONG: 7/7 kapı • "
-    f"SKOR≥{STRONG_LONG_SCORE_MIN} (LONG) / SKOR≤{STRONG_SHORT_SCORE_MAX} (SHORT) • "
-    f"Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s"
+    f"TF={TF} • HTF={HTF} • STRONG: {GATES_REQUIRED_STRONG}/{GATES_TOTAL} Kapı • "
+    f"Skor adımı: {SCORE_STEP} • Auto: {AUTO_REFRESH_SEC}s • Telegram rapor: {REPORT_EVERY_MIN}dk"
 )
 
 st_autorefresh(interval=AUTO_REFRESH_SEC * 1000, key="auto_refresh")
@@ -492,6 +509,7 @@ for i, sym in enumerate(scan_list, start=1):
     progress.progress(i / max(1, len(scan_list)), text=f"Taranıyor: {i}/{len(scan_list)} • {sym}")
 
     base = sym.split("/")[0]
+
     res_ku = None
     res_ok = None
 
@@ -499,13 +517,13 @@ for i, sym in enumerate(scan_list, start=1):
         df = fetch_ohlcv_df(kucoin, sym, TF, 200)
         dfh = fetch_ohlcv_df(kucoin, sym, HTF, 200)
         if df is not None and dfh is not None:
-            res_ku = score_symbol(df, dfh)
+            res_ku = score_symbol_7gates(df, dfh)
 
     if sym in ok_set:
         df = fetch_ohlcv_df(okx, sym, TF, 200)
         dfh = fetch_ohlcv_df(okx, sym, HTF, 200)
         if df is not None and dfh is not None:
-            res_ok = score_symbol(df, dfh)
+            res_ok = score_symbol_7gates(df, dfh)
 
     source = None
     chosen = None
@@ -516,9 +534,12 @@ for i, sym in enumerate(scan_list, start=1):
             gates = min(res_ku["gates"], res_ok["gates"])
             score = int(round((res_ku["score"] + res_ok["score"]) / 2))
             raw = int(round((res_ku["raw"] + res_ok["raw"]) / 2))
-            chosen = {"direction": direction, "gates": gates, "score": score, "raw": raw}
+            atrx = float((res_ku["atr_spike"] + res_ok["atr_spike"]) / 2)
+            smap = float((res_ku["sma_dist_pct"] + res_ok["sma_dist_pct"]) / 2)
+            chosen = {"direction": direction, "gates": gates, "score": score, "raw": raw, "atr_spike": atrx, "sma_dist_pct": smap}
             source = "BOTH"
         else:
+            # yön ayrışması: kapı sayısı yüksek olanı seç
             pick = res_ku if res_ku["gates"] > res_ok["gates"] else res_ok
             chosen = pick
             source = "BOTH"
@@ -540,7 +561,7 @@ for i, sym in enumerate(scan_list, start=1):
             qv = max(qv, safe_float(t.get("quoteVolume"), 0.0))
         if source in ("OKX", "BOTH"):
             t = okx.fetch_ticker(sym)
-            last_price = max(last_price, safe_float(t.get("last"), last_price))
+            last_price = max(last_price, safe_float(t.get("last"), 0.0))
             qv = max(qv, safe_float(t.get("quoteVolume"), 0.0))
     except Exception:
         pass
@@ -549,7 +570,7 @@ for i, sym in enumerate(scan_list, start=1):
     gates = int(chosen["gates"])
     score = int(chosen["score"])
     raw = int(chosen["raw"])
-    strong = strong_flag(direction, gates, score)
+    strong = strong_flag(direction, gates)
 
     row = {
         "YÖN": direction,
@@ -561,6 +582,8 @@ for i, sym in enumerate(scan_list, start=1):
         "KAPI": gates,
         "STRONG": strong,
         "SOURCE": source,
+        "ATRx": float(chosen.get("atr_spike", 0.0)),
+        "SMA%": float(chosen.get("sma_dist_pct", 0.0)),
     }
     rows.append(row)
 
@@ -574,6 +597,7 @@ if df_all.empty:
     st.warning("Hiç aday çıkmadı. Filtreler çok sert olabilir (hacim/spread).")
     st.stop()
 
+# UI sıralama: BOTH + STRONG + KAPI + SKOR
 df_all["_prio_both"] = (df_all["SOURCE"] == "BOTH").astype(int)
 df_all["_prio_strong"] = (df_all["STRONG"] == True).astype(int)
 df_all["_score_rank"] = np.where(df_all["YÖN"] == "SHORT", 100 - df_all["SKOR"], df_all["SKOR"])
@@ -590,13 +614,15 @@ cnt_short = int((df_all["YÖN"] == "SHORT").sum())
 
 st.markdown(f"**İstanbul Time:** `{now_istanbul_str()}`")
 st.success("Tarama bitti ✅")
+
 st.info(f"✅ STRONG LONG: {strong_long} | 💀 STRONG SHORT: {strong_short} | LONG: {cnt_long} | SHORT: {cnt_short}")
 
+# UI tablo: 10 LONG + 10 SHORT
 df_long = df_all[df_all["YÖN"] == "LONG"].head(TABLE_N_LONG)
 df_short = df_all[df_all["YÖN"] == "SHORT"].head(TABLE_N_SHORT)
 df_show = pd.concat([df_long, df_short], ignore_index=True)
 
-if strong_long + strong_short == 0:
+if (strong_long + strong_short) == 0:
     st.warning("⚠️ Şu an STRONG yok. En iyi TOP adaylarla tablo dolduruldu.")
 else:
     st.success("✅ STRONG bulundu. Kalan boşluklar TOP adaylarla dolduruldu.")
@@ -612,11 +638,10 @@ st.dataframe(
 # =========================
 # TELEGRAM LOGIC
 # =========================
-# STRONG varsa: tek mesaj + max 20 (liste)
-# STRONG yoksa: 20 dakikada bir rapor + max 20 (liste)
-
+# STRONG varsa: TEK MESAJ listesi (max 20) — yeni sinyaller gelince
+# STRONG yoksa: 20 dakikada bir rapor (max 20)
 if tg_enabled():
-    df_strongs_best = _pick_top_for_telegram(df_all, only_strong_both=True)
+    df_strongs_best = _pick_top20(df_all, only_strong_both=True)
 
     new_keys = []
     if not df_strongs_best.empty:
@@ -627,16 +652,17 @@ if tg_enabled():
                 new_keys.append(k)
 
         if new_keys:
-            tg_send_report_list(df_strongs_best)
+            tg_send_list("✅ <b>STRONG SİNYAL</b>", df_strongs_best)
 
     if not new_keys:
         now_ts = time.time()
         if (now_ts - st.session_state.last_report_ts) >= (REPORT_EVERY_MIN * 60):
-            df_best20 = _pick_top_for_telegram(df_all, only_strong_both=False)
-            tg_send_report_list(df_best20)
+            df_best20 = _pick_top20(df_all, only_strong_both=False)
+            tg_send_list("📋 <b>Gözcü Raporu (L/S)</b>", df_best20)
             st.session_state.last_report_ts = now_ts
 
-with st.expander("🧪 Telegram Test (İstersen)"):
+
+with st.expander("🧪 Telegram Test"):
     if tg_enabled():
         if st.button("Test Mesajı Gönder"):
             ok = send_telegram_html(
