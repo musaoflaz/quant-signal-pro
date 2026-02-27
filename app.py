@@ -13,13 +13,42 @@ import ccxt
 import streamlit as st
 
 # =========================
-# GLOBAL TF/HTF (FIX: TF not defined)
+# GLOBAL CONFIG (FIX: undefined vars)
 # =========================
 TF = os.getenv("TF", "15m")
 HTF = os.getenv("HTF", "1h")
-# =========================
-# PAGE
-# =========================
+
+TOP_N_PER_EXCHANGE = int(os.getenv("TOP_N_PER_EXCHANGE", "60"))
+MIN_QV_24H_USDT = float(os.getenv("MIN_QV_24H_USDT", "300000"))
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.35"))
+
+GATES_TOTAL = int(os.getenv("GATES_TOTAL", "9"))
+GATES_REQUIRED_STRONG = int(os.getenv("GATES_REQUIRED_STRONG", "8"))
+SCORE_STEP = int(os.getenv("SCORE_STEP", "2"))
+
+BTC_GUARD_ENABLE = os.getenv("BTC_GUARD_ENABLE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTC/USDT")
+BTC_TREND_TF = os.getenv("BTC_TREND_TF", "15m")
+BTC_ATR_TF = os.getenv("BTC_ATR_TF", "1h")
+BTC_ATR_SPIKE_MULT = float(os.getenv("BTC_ATR_SPIKE_MULT", "2.0"))
+
+LQ_ANCHOR_ENABLE = os.getenv("LQ_ANCHOR_ENABLE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+LQ_VWAP_TOL_PCT = float(os.getenv("LQ_VWAP_TOL_PCT", "0.20"))
+LQ_EXTEND_MAX_PCT = float(os.getenv("LQ_EXTEND_MAX_PCT", "1.20"))
+LQ_POC_BINS = int(os.getenv("LQ_POC_BINS", "24"))
+LQ_OB_LOOKBACK = int(os.getenv("LQ_OB_LOOKBACK", "30"))
+
+RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "75"))
+RSI_SHORT_MIN = float(os.getenv("RSI_SHORT_MIN", "25"))
+
+RETRACE_ENABLE = os.getenv("RETRACE_ENABLE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+RETRACE_EMA_LEN = int(os.getenv("RETRACE_EMA_LEN", "21"))
+RETRACE_ZONE_BAND_BPS = int(os.getenv("RETRACE_ZONE_BAND_BPS", "25"))
+RETRACE_NEAR_EMA_BPS = int(os.getenv("RETRACE_NEAR_EMA_BPS", "15"))
+RETRACE_MIN_DISTANCE_FORCE_WAIT_BPS = int(os.getenv("RETRACE_MIN_DISTANCE_FORCE_WAIT_BPS", "60"))
+RETRACE_CONFIRM_CANDLES = int(os.getenv("RETRACE_CONFIRM_CANDLES", "1"))
+RETRACE_REQUIRE_REJECTION = os.getenv("RETRACE_REQUIRE_REJECTION", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+RETRACE_TTL_MIN = int(os.getenv("RETRACE_TTL_MIN", "45"))
 st.set_page_config(page_title="SNIPER v4-dev Test UI (KuCoin+OKX)", layout="wide")
 
 
