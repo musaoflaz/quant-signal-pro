@@ -12,7 +12,11 @@ import requests
 import ccxt
 import streamlit as st
 
-
+# =========================
+# GLOBAL TF/HTF (FIX: TF not defined)
+# =========================
+TF = os.getenv("TF", "15m")
+HTF = os.getenv("HTF", "1h")
 # =========================
 # PAGE
 # =========================
