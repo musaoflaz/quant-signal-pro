@@ -12,14 +12,14 @@ import ccxt
 import streamlit as st
 
 # ============================================================
-# SNIPER v4-dev TEST UI (Streamlit Cloud) - SINGLE SCREEN
+# SNIPER v4-dev TEST UI (Streamlit Cloud)
 # - No sidebar
-# - One-shot scan (no infinite loop)
-# - Includes: BTC Guard + Liquidity Anchor + EMA Retrace + TTL
+# - One-shot scan (RUN SCAN)
+# - Includes: BTC Guard + Liquidity Anchor + EMA Retrace Gate + TTL
 # ============================================================
 
 # ----------------------------
-# GLOBAL CONFIG (hard-defined)
+# GLOBAL CONFIG
 # ----------------------------
 TF = os.getenv("TF", "15m")
 HTF = os.getenv("HTF", "1h")
@@ -37,45 +37,53 @@ RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "75"))
 RSI_SHORT_MIN = float(os.getenv("RSI_SHORT_MIN", "25"))
 
 # BTC Guard
-BTC_GUARD_ENABLE = os.getenv("BTC_GUARD_ENABLE", "1").strip().lower() in ("1","true","yes","y","on")
+BTC_GUARD_ENABLE = os.getenv("BTC_GUARD_ENABLE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTC/USDT")
 BTC_TREND_TF = os.getenv("BTC_TREND_TF", "15m")
 BTC_ATR_TF = os.getenv("BTC_ATR_TF", "1h")
 BTC_ATR_SPIKE_MULT = float(os.getenv("BTC_ATR_SPIKE_MULT", "2.0"))
 
 # Liquidity Anchor
-LQ_ANCHOR_ENABLE = os.getenv("LQ_ANCHOR_ENABLE", "1").strip().lower() in ("1","true","yes","y","on")
+LQ_ANCHOR_ENABLE = os.getenv("LQ_ANCHOR_ENABLE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 LQ_VWAP_TOL_PCT = float(os.getenv("LQ_VWAP_TOL_PCT", "0.20"))
 LQ_EXTEND_MAX_PCT = float(os.getenv("LQ_EXTEND_MAX_PCT", "1.20"))
 LQ_POC_BINS = int(os.getenv("LQ_POC_BINS", "24"))
 LQ_OB_LOOKBACK = int(os.getenv("LQ_OB_LOOKBACK", "30"))
 
 # EMA Retrace Gate
-RETRACE_ENABLE = os.getenv("RETRACE_ENABLE", "1").strip().lower() in ("1","true","yes","y","on")
+RETRACE_ENABLE = os.getenv("RETRACE_ENABLE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 RETRACE_EMA_LEN = int(os.getenv("RETRACE_EMA_LEN", "21"))
-RETRACE_ZONE_BAND_BPS = int(os.getenv("RETRACE_ZONE_BAND_BPS", "25"))      # 0.25%
-RETRACE_NEAR_EMA_BPS = int(os.getenv("RETRACE_NEAR_EMA_BPS", "15"))        # 0.15%
+RETRACE_ZONE_BAND_BPS = int(os.getenv("RETRACE_ZONE_BAND_BPS", "25"))  # 0.25%
+RETRACE_NEAR_EMA_BPS = int(os.getenv("RETRACE_NEAR_EMA_BPS", "15"))  # 0.15%
 RETRACE_MIN_DISTANCE_FORCE_WAIT_BPS = int(os.getenv("RETRACE_MIN_DISTANCE_FORCE_WAIT_BPS", "60"))  # 0.60%
 RETRACE_CONFIRM_CANDLES = int(os.getenv("RETRACE_CONFIRM_CANDLES", "1"))
-RETRACE_REQUIRE_REJECTION = os.getenv("RETRACE_REQUIRE_REJECTION", "1").strip().lower() in ("1","true","yes","y","on")
+RETRACE_REQUIRE_REJECTION = os.getenv("RETRACE_REQUIRE_REJECTION", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 RETRACE_TTL_MIN = int(os.getenv("RETRACE_TTL_MIN", "45"))
 RETRACE_APPLY_MIN_GATES = int(os.getenv("RETRACE_APPLY_MIN_GATES", str(max(1, GATES_REQUIRED_STRONG - 1))))
 
 # Telegram (optional)
-TELEGRAM_ENABLE = os.getenv("TELEGRAM_ENABLE", "0").strip().lower() in ("1","true","yes","y","on")
-TG_A_MODE = os.getenv("TG_A_MODE", "1").strip().lower() in ("1","true","yes","y","on")
+TELEGRAM_ENABLE = os.getenv("TELEGRAM_ENABLE", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+TG_A_MODE = os.getenv("TG_A_MODE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 DEV_PREFIX = os.getenv("DEV_PREFIX", "[DEV]")
 
 
 # ----------------------------
-# Streamlit setup
+# Streamlit UI
 # ----------------------------
 st.set_page_config(page_title="SNIPER v4-dev Test UI", layout="wide")
 st.title("🔥 SNIPER v4-dev Test UI (Streamlit Cloud)")
 st.caption(
     "KuCoin + OKX tarar. BTC Guard + Liquidity Anchor + EMA Retrace Gate + TTL + Near-Strong mantığı test içindir. "
-    "Sonsuz worker loop YOK: RUN SCAN ile one-shot çalışır."
+    "Sonsuz worker loop yok: RUN SCAN ile one-shot çalışır."
 )
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("TF", TF)
+m2.metric("HTF", HTF)
+m3.metric("TOP_N/EX", TOP_N_PER_EXCHANGE)
+m4.metric("GATES", f"{GATES_REQUIRED_STRONG}/{GATES_TOTAL}")
+
+run_btn = st.button("🚀 RUN SCAN")
 
 
 # ----------------------------
@@ -105,9 +113,6 @@ def escape_html_text(s: str) -> str:
     return html.escape(str(s), quote=False)
 
 
-# ----------------------------
-# Telegram secrets (Streamlit Cloud Secrets OR env)
-# ----------------------------
 def get_secret(key: str, default: str = "") -> str:
     try:
         if key in st.secrets:
@@ -117,6 +122,9 @@ def get_secret(key: str, default: str = "") -> str:
     return str(os.getenv(key, default) or "")
 
 
+# ----------------------------
+# Telegram (optional)
+# ----------------------------
 TG_TOKEN = get_secret("TG_TOKEN", "")
 TG_CHAT_ID = get_secret("TG_CHAT_ID", "")
 
@@ -296,29 +304,13 @@ class RetraceGate:
         try:
             if df is None or df.empty or "close" not in df.columns:
                 return None
-            if len(df) < max(20, length + 2):
+            if len(df) < max(30, length + 5):
                 return None
             close = pd.to_numeric(df["close"], errors="coerce")
             e = close.ewm(span=length, adjust=False).mean().iloc[-1]
             if pd.isna(e):
                 return None
             return float(e)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _last_ohlc(df: pd.DataFrame) -> Optional[Tuple[float, float, float, float]]:
-        try:
-            if df is None or df.empty:
-                return None
-            for col in ("open", "high", "low", "close"):
-                if col not in df.columns:
-                    return None
-            o = float(df["open"].iloc[-1])
-            h = float(df["high"].iloc[-1])
-            l = float(df["low"].iloc[-1])
-            c = float(df["close"].iloc[-1])
-            return o, h, l, c
         except Exception:
             return None
 
@@ -334,13 +326,6 @@ class RetraceGate:
         return ((price - ema_val) / ema_val) * 10000.0
 
     def evaluate(self, symbol: str, side: str, df_15m: pd.DataFrame) -> Tuple[bool, str]:
-        """
-        Returns (is_wait, note)
-        note examples:
-          - WAIT:EMA_RETRACE_LONG/SHORT(...)
-          - ENTRY_TRIGGERED_LONG/SHORT(...)
-          - RETRACE:EXPIRED(...)
-        """
         if not RETRACE_ENABLE:
             return False, ""
 
@@ -349,19 +334,24 @@ class RetraceGate:
             return False, ""
 
         ema_val = self._ema_last(df_15m, RETRACE_EMA_LEN)
-        ohlc = self._last_ohlc(df_15m)
-        if ema_val is None or ohlc is None:
+        if ema_val is None:
             return False, ""
 
-        _, _, _, c = ohlc
-        price = float(c)
+        if df_15m is None or df_15m.empty:
+            return False, ""
+
+        for col in ("open", "high", "low", "close"):
+            if col not in df_15m.columns:
+                return False, ""
+
+        price = float(df_15m["close"].iloc[-1])
         zone_low, zone_high = self._zone(ema_val, RETRACE_ZONE_BAND_BPS)
         dist_bps = self._dist_bps(price, ema_val)
         now_ts = time.time()
 
         def confirm_trigger() -> bool:
             n = int(max(1, RETRACE_CONFIRM_CANDLES))
-            if df_15m is None or len(df_15m) < n:
+            if len(df_15m) < n:
                 return False
             tail = df_15m.tail(n)
             in_zone = (tail["low"] <= zone_high) & (tail["high"] >= zone_low)
@@ -551,21 +541,12 @@ def liquidity_anchor_ok(df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
 
 
 # ----------------------------
-# Exchange functions
+# Exchange helpers
 # ----------------------------
 def get_exchanges():
     kucoin = ccxt.kucoin({"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": "spot"}})
     okx = ccxt.okx({"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": "spot"}})
     return kucoin, okx
-
-
-def load_markets_safe(ex, name: str) -> bool:
-    try:
-        ex.load_markets()
-        return True
-    except Exception as e:
-        st.error(f"{name}: load_markets failed: {e}")
-        return False
 
 
 def symbol_clean(sym: str) -> str:
@@ -579,13 +560,22 @@ def is_usdt_spot_symbol(sym: str) -> bool:
 
 def is_junk_symbol(base: str) -> bool:
     b = base.upper()
-    junk = {"USDT","USDC","BUSD","TUSD","DAI","FDUSD","USDP","EUR","EURT","3S","3L","5S","5L","BULL","BEAR","UP","DOWN"}
+    junk = {"USDT", "USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP", "EUR", "EURT", "3S", "3L", "5S", "5L", "BULL", "BEAR", "UP", "DOWN"}
     if b in junk:
         return True
-    for suf in ["3L","3S","5L","5S","BULL","BEAR","UP","DOWN"]:
+    for suf in ["3L", "3S", "5L", "5S", "BULL", "BEAR", "UP", "DOWN"]:
         if b.endswith(suf):
             return True
     return False
+
+
+def load_markets_safe(ex, name: str) -> bool:
+    try:
+        ex.load_markets()
+        return True
+    except Exception as e:
+        st.error(f"{name}: load_markets failed: {e}")
+        return False
 
 
 def fetch_top_usdt_symbols(ex, top_n: int) -> List[str]:
@@ -632,13 +622,13 @@ def fetch_ohlcv_df(ex, symbol: str, timeframe: str, limit: int = 200):
         o = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not o or len(o) < 120:
             return None
-        return pd.DataFrame(o, columns=["ts","open","high","low","close","volume"])
+        return pd.DataFrame(o, columns=["ts", "open", "high", "low", "close", "volume"])
     except Exception:
         return None
 
 
 # ----------------------------
-# BTC Guard context
+# BTC context
 # ----------------------------
 def get_btc_context(kucoin, okx) -> dict:
     ctx = {
@@ -817,6 +807,7 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
 
     ku_syms = fetch_top_usdt_symbols(kucoin, TOP_N_PER_EXCHANGE)
     ok_syms = fetch_top_usdt_symbols(okx, TOP_N_PER_EXCHANGE)
+
     ku_set = set(ku_syms)
     ok_set = set(ok_syms)
     scan_list = sorted(list(ku_set.union(ok_set)))
@@ -827,6 +818,7 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
 
         res_ku = None
         res_ok = None
+
         df_for_lq = None
         df_for_retrace = None
 
@@ -835,16 +827,20 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
             dfh = fetch_ohlcv_df(kucoin, sym, HTF, 200)
             if df is not None and dfh is not None:
                 res_ku = score_symbol(df, dfh, btc_ctx)
-                df_for_lq = df_for_lq or df
-                df_for_retrace = df_for_retrace or df
+                if df_for_lq is None:
+                    df_for_lq = df
+                if df_for_retrace is None:
+                    df_for_retrace = df
 
         if sym in ok_set:
-            df = fetch_ohlcv_df(okx, sym, TF, 200)
-            dfh = fetch_ohlcv_df(okx, sym, HTF, 200)
-            if df is not None and dfh is not None:
-                res_ok = score_symbol(df, dfh, btc_ctx)
-                df_for_lq = df_for_lq or df
-                df_for_retrace = df_for_retrace or df
+            df2 = fetch_ohlcv_df(okx, sym, TF, 200)
+            dfh2 = fetch_ohlcv_df(okx, sym, HTF, 200)
+            if df2 is not None and dfh2 is not None:
+                res_ok = score_symbol(df2, dfh2, btc_ctx)
+                if df_for_lq is None:
+                    df_for_lq = df2
+                if df_for_retrace is None:
+                    df_for_retrace = df2
 
         if not (res_ku or res_ok):
             continue
@@ -879,9 +875,9 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
                 last_price = max(last_price, safe_float(t.get("last"), 0.0))
                 qv = max(qv, safe_float(t.get("quoteVolume"), 0.0))
             if res_ok:
-                t = okx.fetch_ticker(sym)
-                last_price = max(last_price, safe_float(t.get("last"), 0.0))
-                qv = max(qv, safe_float(t.get("quoteVolume"), 0.0))
+                t2 = okx.fetch_ticker(sym)
+                last_price = max(last_price, safe_float(t2.get("last"), 0.0))
+                qv = max(qv, safe_float(t2.get("quoteVolume"), 0.0))
         except Exception:
             pass
 
@@ -895,7 +891,7 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
             status = "WAIT"
             note_parts.append(block_note)
 
-        # BTC guard annotations
+        # BTC guard
         if BTC_GUARD_ENABLE and btc_ctx.get("ok"):
             if direction == "LONG" and btc_ctx.get("below_ema21_15m") is True:
                 status = "WAIT"
@@ -904,7 +900,7 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
                 status = "WAIT"
                 note_parts.append("WAIT:BTC_ATR_SHOCK")
 
-        # Liquidity Anchor blocks only strong/verified
+        # Liquidity anchor blocks only strong/verified
         lq_ok, lq_note = liquidity_anchor_ok(df_for_lq, direction)
         if lq_note:
             note_parts.append(lq_note)
@@ -914,7 +910,7 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
             verified = False
             note_parts.append("WAIT:LowLiquidity")
 
-        # Retrace Gate applies only near-strong and not already blocked
+        # Retrace gate
         if (
             RETRACE_ENABLE
             and status == "OK"
@@ -952,16 +948,8 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
 
 
 # ----------------------------
-# UI
+# Execute
 # ----------------------------
-colA, colB, colC, colD = st.columns(4)
-colA.metric("TF", TF)
-colB.metric("HTF", HTF)
-colC.metric("TOP_N/EX", TOP_N_PER_EXCHANGE)
-colD.metric("GATES", f"{GATES_REQUIRED_STRONG}/{GATES_TOTAL}")
-
-run_btn = st.button("🚀 RUN SCAN")
-
 if run_btn:
     with st.spinner("Veri çekiliyor... KuCoin + OKX taranıyor..."):
         t0 = time.time()
@@ -976,48 +964,46 @@ if run_btn:
 
             if df_all.empty:
                 st.warning("Aday yok.")
-                st.stop()
-
-            # sort
-            df_all["_prio_verified"] = (df_all["VERIFIED"] == True).astype(int)
-            df_all["_prio_strong"] = (df_all["STRONG"] == True).astype(int)
-            df_all["_score_rank"] = np.where(df_all["YÖN"] == "SHORT", 100 - df_all["SKOR"], df_all["SKOR"])
-            df_all = df_all.sort_values(
-                by=["_prio_verified", "_prio_strong", "KAPI", "_score_rank", "QV_24H"],
-                ascending=[False, False, False, False, False]
-            ).drop(columns=["_prio_verified", "_prio_strong", "_score_rank"])
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("TOTAL", int(len(df_all)))
-            c2.metric("STRONG", int((df_all["STRONG"] == True).sum()))
-            c3.metric("VERIFIED", int((df_all["VERIFIED"] == True).sum()))
-            c4.metric("WAIT", int((df_all["STATUS"] == "WAIT").sum()))
-
-            st.subheader("Top 50")
-            st.dataframe(df_all.head(50), use_container_width=True)
-
-            st.subheader("WAIT (Filters / Retrace)")
-            st.dataframe(df_all[df_all["STATUS"] == "WAIT"].head(200), use_container_width=True)
-
-            st.subheader("Only STRONG")
-            st.dataframe(df_all[df_all["STRONG"] == True].head(200), use_container_width=True)
-
-            # Telegram (optional, DEV prefix)
-            if tg_enabled():
-                verified_rows = df_all[df_all["VERIFIED"] == True].to_dict("records")
-                best_rows = df_all.head(50).to_dict("records")
-
-                if TG_A_MODE:
-                    if verified_rows:
-                        ok, info = tg_send("VERIFIED STRONG (BOTH)", verified_rows[:20], note="🔒 KuCoin + OKX aynı yön + STRONG + Filtreler OK")
-                    else:
-                        ok, info = tg_send("Gözcü Raporu (En Olası Adaylar)", best_rows[:20], note="📌 Verified STRONG yok. Liste 'en olası' adaylardır.")
-                else:
-                    ok, info = tg_send("Top Adaylar", best_rows[:20], note="(A MODE kapalı)")
-
-                st.info(f"Telegram: {'OK' if ok else 'FAIL'} | {info}")
             else:
-                st.caption("Telegram kapalı (Secrets yoksa normal).")
+                df_all["_prio_verified"] = (df_all["VERIFIED"] == True).astype(int)
+                df_all["_prio_strong"] = (df_all["STRONG"] == True).astype(int)
+                df_all["_score_rank"] = np.where(df_all["YÖN"] == "SHORT", 100 - df_all["SKOR"], df_all["SKOR"])
+                df_all = df_all.sort_values(
+                    by=["_prio_verified", "_prio_strong", "KAPI", "_score_rank", "QV_24H"],
+                    ascending=[False, False, False, False, False]
+                ).drop(columns=["_prio_verified", "_prio_strong", "_score_rank"])
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("TOTAL", int(len(df_all)))
+                c2.metric("STRONG", int((df_all["STRONG"] == True).sum()))
+                c3.metric("VERIFIED", int((df_all["VERIFIED"] == True).sum()))
+                c4.metric("WAIT", int((df_all["STATUS"] == "WAIT").sum()))
+
+                st.subheader("Top 50")
+                st.dataframe(df_all.head(50), use_container_width=True)
+
+                st.subheader("WAIT (Filters / Retrace)")
+                st.dataframe(df_all[df_all["STATUS"] == "WAIT"].head(200), use_container_width=True)
+
+                st.subheader("Only STRONG")
+                st.dataframe(df_all[df_all["STRONG"] == True].head(200), use_container_width=True)
+
+                # Telegram (optional)
+                if tg_enabled():
+                    verified_rows = df_all[df_all["VERIFIED"] == True].to_dict("records")
+                    best_rows = df_all.head(50).to_dict("records")
+
+                    if TG_A_MODE:
+                        if verified_rows:
+                            ok, info = tg_send("VERIFIED STRONG (BOTH)", verified_rows[:20], note="🔒 KuCoin + OKX aynı yön + STRONG + Filtreler OK")
+                        else:
+                            ok, info = tg_send("Gözcü Raporu (En Olası Adaylar)", best_rows[:20], note="📌 Verified STRONG yok. Liste 'en olası' adaylardır.")
+                    else:
+                        ok, info = tg_send("Top Adaylar", best_rows[:20], note="(A MODE kapalı)")
+
+                    st.info(f"Telegram: {'OK' if ok else 'FAIL'} | {info}")
+                else:
+                    st.caption("Telegram kapalı (Secrets yoksa normal).")
 
         except Exception as e:
             st.error(f"Scan ERROR: {e}")
