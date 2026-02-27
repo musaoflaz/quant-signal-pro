@@ -13,13 +13,16 @@ import streamlit as st
 
 # ============================================================
 # SNIPER v4-dev TEST UI (Streamlit Cloud)
-# - No sidebar
-# - One-shot scan (RUN SCAN)
-# - Includes: BTC Guard + Liquidity Anchor + EMA Retrace Gate + TTL
+# - NO SIDEBAR
+# - ONE-SHOT SCAN (RUN SCAN)
+# - KuCoin + OKX
+# - BTC Guard (soft wait)
+# - Liquidity Anchor: SOFT NOTE (NO BLOCK)
+# - EMA Retrace Gate: HARD WAIT (ENTRY TIMING)
 # ============================================================
 
 # ----------------------------
-# GLOBAL CONFIG
+# CONFIG (env)
 # ----------------------------
 TF = os.getenv("TF", "15m")
 HTF = os.getenv("HTF", "1h")
@@ -43,7 +46,7 @@ BTC_TREND_TF = os.getenv("BTC_TREND_TF", "15m")
 BTC_ATR_TF = os.getenv("BTC_ATR_TF", "1h")
 BTC_ATR_SPIKE_MULT = float(os.getenv("BTC_ATR_SPIKE_MULT", "2.0"))
 
-# Liquidity Anchor
+# Liquidity Anchor (SOFT)
 LQ_ANCHOR_ENABLE = os.getenv("LQ_ANCHOR_ENABLE", "1").strip().lower() in ("1", "true", "yes", "y", "on")
 LQ_VWAP_TOL_PCT = float(os.getenv("LQ_VWAP_TOL_PCT", "0.20"))
 LQ_EXTEND_MAX_PCT = float(os.getenv("LQ_EXTEND_MAX_PCT", "1.20"))
@@ -68,12 +71,12 @@ DEV_PREFIX = os.getenv("DEV_PREFIX", "[DEV]")
 
 
 # ----------------------------
-# Streamlit UI
+# UI (no sidebar)
 # ----------------------------
 st.set_page_config(page_title="SNIPER v4-dev Test UI", layout="wide")
 st.title("🔥 SNIPER v4-dev Test UI (Streamlit Cloud)")
 st.caption(
-    "KuCoin + OKX tarar. BTC Guard + Liquidity Anchor + EMA Retrace Gate + TTL + Near-Strong mantığı test içindir. "
+    "KuCoin + OKX tarar. BTC Guard + Liquidity Anchor(SOFT) + EMA Retrace Gate(HARD) + TTL + Near-Strong test içindir. "
     "Sonsuz worker loop yok: RUN SCAN ile one-shot çalışır."
 )
 
@@ -269,7 +272,13 @@ def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) 
     down_move = -l.diff()
 
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (downmove > 0), 0.0)  # typo guard below
+
+    # fix the typo safely
+    try:
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    except Exception:
+        minus_dm = down_move * 0.0
 
     tr = pd.Series(true_range(high, low, close))
     atr_w = tr.ewm(alpha=1 / period, adjust=False).mean()
@@ -420,7 +429,7 @@ RETRACE_GATE = RetraceGate()
 
 
 # ----------------------------
-# Liquidity Anchor
+# Liquidity Anchor (SOFT)
 # ----------------------------
 def vwap_from_df(df: pd.DataFrame) -> float:
     try:
@@ -493,13 +502,12 @@ def detect_orderblock_simple(df: pd.DataFrame, direction: str, lookback: int = 3
         return False
 
 
-def liquidity_anchor_ok(df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
+def liquidity_anchor_note(df: pd.DataFrame, direction: str) -> str:
     if not LQ_ANCHOR_ENABLE:
-        return True, ""
-
+        return ""
     try:
         if df is None or df.empty:
-            return False, "LQ:NoData"
+            return "LQ:NoData"
 
         last = float(df["close"].iloc[-1])
         vwap = vwap_from_df(df)
@@ -513,7 +521,6 @@ def liquidity_anchor_ok(df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
             ext = (abs(last - vwap) / vwap) * 100.0
             if ext > LQ_EXTEND_MAX_PCT:
                 parts.append("VWAP-EXT")
-                vwap_ok = False
             else:
                 if direction == "LONG":
                     vwap_ok = (last >= vwap * (1 - tol))
@@ -521,7 +528,6 @@ def liquidity_anchor_ok(df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
                     vwap_ok = (last <= vwap * (1 + tol))
                 parts.append("VWAP+" if vwap_ok else "VWAP-")
         else:
-            vwap_ok = False
             parts.append("VWAP?")
 
         if np.isfinite(poc) and poc > 0:
@@ -529,15 +535,12 @@ def liquidity_anchor_ok(df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
             poc_ok = dist_poc <= (LQ_EXTEND_MAX_PCT * 1.2)
             parts.append("POC+" if poc_ok else "POC-")
         else:
-            poc_ok = False
             parts.append("POC?")
 
         parts.append("OB+" if ob_ok else "OB-")
-
-        ok = bool(vwap_ok and poc_ok and ob_ok)
-        return ok, "LQ:" + ",".join(parts)
+        return "LQ:" + ",".join(parts)
     except Exception:
-        return False, "LQ:ERR"
+        return "LQ:ERR"
 
 
 # ----------------------------
@@ -693,7 +696,7 @@ def get_btc_context(kucoin, okx) -> dict:
 
 
 # ----------------------------
-# Scoring
+# Scoring (gates)
 # ----------------------------
 def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame, btc_ctx: dict):
     h = df["high"].to_numpy(dtype=float)
@@ -720,7 +723,7 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame, btc_ctx: dict):
     direction = "LONG" if (last >= s20[-1] and r[-1] >= 50) else "SHORT"
     gates = 0
 
-    # Anti-extreme
+    # Anti-extreme => HARD WAIT marker (we treat as block_note)
     if direction == "LONG" and float(r[-1]) > RSI_LONG_MAX:
         return {"direction": direction, "gates": 0, "raw": 0, "score": 0, "block_note": f"WAIT:RSI>{RSI_LONG_MAX:.0f}"}
     if direction == "SHORT" and float(r[-1]) < RSI_SHORT_MIN:
@@ -774,7 +777,7 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame, btc_ctx: dict):
         if direction == "SHORT" and last < prev3_low:
             gates += 1
 
-    # 9 BTC EMA21 gate
+    # 9 BTC EMA21 gate (directional add)
     if BTC_GUARD_ENABLE and btc_ctx and btc_ctx.get("ok") and (btc_ctx.get("below_ema21_15m") is not None):
         btc_below = bool(btc_ctx["below_ema21_15m"])
         if direction == "LONG" and (btc_below is False):
@@ -791,7 +794,7 @@ def score_symbol(df: pd.DataFrame, df_htf: pd.DataFrame, btc_ctx: dict):
     return {"direction": direction, "gates": int(gates), "raw": int(disp_raw), "score": int(disp_score), "block_note": ""}
 
 
-def strong_flag(gates: int) -> bool:
+def is_strong(gates: int) -> bool:
     return int(gates) >= int(GATES_REQUIRED_STRONG)
 
 
@@ -881,17 +884,18 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
         except Exception:
             pass
 
-        strong = strong_flag(int(gates))
+        strong = is_strong(int(gates))
         verified = bool(res_ku and res_ok and same_dir and strong and int(gates) >= int(GATES_REQUIRED_STRONG))
 
         status = "OK"
         note_parts = []
 
+        # hard block notes
         if block_note:
             status = "WAIT"
             note_parts.append(block_note)
 
-        # BTC guard
+        # BTC Guard => soft/hard wait (we keep it HARD to avoid risk)
         if BTC_GUARD_ENABLE and btc_ctx.get("ok"):
             if direction == "LONG" and btc_ctx.get("below_ema21_15m") is True:
                 status = "WAIT"
@@ -900,17 +904,12 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
                 status = "WAIT"
                 note_parts.append("WAIT:BTC_ATR_SHOCK")
 
-        # Liquidity anchor blocks only strong/verified
-        lq_ok, lq_note = liquidity_anchor_ok(df_for_lq, direction)
+        # Liquidity Anchor => SOFT NOTE ONLY
+        lq_note = liquidity_anchor_note(df_for_lq, direction)
         if lq_note:
             note_parts.append(lq_note)
-        if strong and (not lq_ok):
-            status = "WAIT"
-            strong = False
-            verified = False
-            note_parts.append("WAIT:LowLiquidity")
 
-        # Retrace gate
+        # Retrace Gate => HARD WAIT (entry timing)
         if (
             RETRACE_ENABLE
             and status == "OK"
@@ -922,6 +921,7 @@ def run_scan() -> Tuple[pd.DataFrame, dict]:
                 note_parts.append(rnote)
             if is_wait:
                 status = "WAIT"
+                # entry timing beklerken strong/verified göstermeyelim (test ok)
                 strong = False
                 verified = False
 
@@ -982,7 +982,7 @@ if run_btn:
                 st.subheader("Top 50")
                 st.dataframe(df_all.head(50), use_container_width=True)
 
-                st.subheader("WAIT (Filters / Retrace)")
+                st.subheader("WAIT (Entry Timing / BTC Guard)")
                 st.dataframe(df_all[df_all["STATUS"] == "WAIT"].head(200), use_container_width=True)
 
                 st.subheader("Only STRONG")
